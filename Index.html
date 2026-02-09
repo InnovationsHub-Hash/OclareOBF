@@ -4,50 +4,221 @@
 <meta charset="UTF-8">
 <title>Oclare Obfuscator V1.0</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Orbitron:wght@600;800&display=swap" rel="stylesheet">
+
 <style>
-body{background:#050508;color:#fff;font-family:monospace;padding:20px}
-textarea{width:100%;height:220px;background:#0c0c14;color:#fff;border:1px solid #222;padding:10px}
-button{margin-top:10px;padding:12px 20px;background:#ff2d95;border:none;color:#fff;cursor:pointer}
-.stats{margin-top:10px;color:#aaa;font-size:12px}
+:root{
+    --bg:#050508;
+    --panel:#0c0c14;
+    --panel2:#111122;
+    --border:#1a1a2e;
+    --primary:#ff2d95;
+    --secondary:#b44aff;
+    --accent:#00d4ff;
+    --success:#00ff88;
+    --text:#fff;
+    --muted:#8a8aa8;
+}
+
+*{box-sizing:border-box}
+
+body{
+    margin:0;
+    background:radial-gradient(circle at top,#12061a,#050508);
+    color:var(--text);
+    font-family:'JetBrains Mono',monospace;
+    min-height:100vh;
+}
+
+header{
+    padding:40px 20px 20px;
+    text-align:center;
+}
+
+.logo{
+    font-family:'Orbitron',sans-serif;
+    font-size:36px;
+    letter-spacing:6px;
+    background:linear-gradient(135deg,#fff,var(--primary),var(--secondary));
+    -webkit-background-clip:text;
+    -webkit-text-fill-color:transparent;
+    filter:drop-shadow(0 0 15px rgba(255,45,149,.5));
+}
+
+.tag{
+    margin-top:6px;
+    font-size:12px;
+    letter-spacing:3px;
+    color:var(--muted);
+}
+
+.container{
+    max-width:1200px;
+    margin:0 auto;
+    padding:20px;
+}
+
+.grid{
+    display:grid;
+    grid-template-columns:1fr 1fr;
+    gap:14px;
+}
+
+.panel{
+    background:var(--panel);
+    border:1px solid var(--border);
+    border-radius:12px;
+    overflow:hidden;
+    display:flex;
+    flex-direction:column;
+}
+
+.panel h3{
+    margin:0;
+    padding:10px 14px;
+    font-size:11px;
+    letter-spacing:2px;
+    color:var(--muted);
+    background:var(--panel2);
+    border-bottom:1px solid var(--border);
+    text-transform:uppercase;
+}
+
+textarea{
+    flex:1;
+    background:transparent;
+    border:none;
+    color:var(--text);
+    padding:14px;
+    font-size:12px;
+    resize:none;
+    outline:none;
+}
+
+textarea::placeholder{color:#555}
+
+textarea.output{
+    color:var(--success);
+    font-size:10px;
+}
+
+.controls{
+    margin:16px 0;
+    display:flex;
+    justify-content:space-between;
+    align-items:center;
+    gap:10px;
+}
+
+button{
+    padding:14px 28px;
+    border:none;
+    border-radius:10px;
+    font-family:'Orbitron',sans-serif;
+    font-size:13px;
+    letter-spacing:3px;
+    cursor:pointer;
+    color:#fff;
+    background:linear-gradient(135deg,var(--primary),var(--secondary),var(--accent));
+    background-size:300% 300%;
+    animation:grad 5s ease infinite;
+    box-shadow:0 8px 30px rgba(255,45,149,.5);
+}
+
+button:disabled{
+    opacity:.5;
+    cursor:not-allowed;
+}
+
+@keyframes grad{
+    0%,100%{background-position:0% 50%}
+    50%{background-position:100% 50%}
+}
+
+.stats{
+    display:flex;
+    gap:16px;
+    font-size:11px;
+    color:var(--muted);
+}
+
+.stat span{
+    color:var(--primary);
+    font-weight:600;
+}
+
+footer{
+    text-align:center;
+    padding:18px;
+    font-size:10px;
+    color:var(--muted);
+}
+
+@media(max-width:900px){
+    .grid{grid-template-columns:1fr}
+}
 </style>
 </head>
 <body>
 
-<h2>Oclare Obfuscator V1.0</h2>
+<header>
+    <div class="logo">OCLARE</div>
+    <div class="tag">V1.0 · Lua VM Obfuscator</div>
+</header>
 
-<textarea id="input" placeholder="Paste Lua here..."></textarea>
-<button id="obfBtn">Obfuscate</button>
-<textarea id="output" placeholder="Obfuscated output..." readonly></textarea>
+<div class="container">
 
-<div class="stats">
-<span id="sTime">0ms</span> •
-<span id="sSize">0 B</span>
+    <div class="grid">
+        <div class="panel">
+            <h3>Input Lua</h3>
+            <textarea id="input" placeholder="print('hello world')"></textarea>
+        </div>
+
+        <div class="panel">
+            <h3>Obfuscated Output</h3>
+            <textarea id="output" class="output" readonly placeholder="Protected code appears here..."></textarea>
+        </div>
+    </div>
+
+    <div class="controls">
+        <button id="obfBtn">OBFUSCATE</button>
+        <div class="stats">
+            <div class="stat">Time: <span id="time">0ms</span></div>
+            <div class="stat">Size: <span id="size">0 B</span></div>
+        </div>
+    </div>
+
 </div>
+
+<footer>
+    Oclare Obfuscator · Client-Side VM · V1
+</footer>
 
 <script>
 const worker = new Worker('./Oclare-Worker.js');
 const input = document.getElementById('input');
 const output = document.getElementById('output');
 const btn = document.getElementById('obfBtn');
-const sTime = document.getElementById('sTime');
-const sSize = document.getElementById('sSize');
+const timeEl = document.getElementById('time');
+const sizeEl = document.getElementById('size');
 
 btn.onclick = () => {
     const code = input.value.trim();
-    if (!code) return;
+    if(!code) return;
 
     btn.disabled = true;
-    btn.textContent = 'Processing...';
+    btn.textContent = 'PROCESSING…';
 
     const start = performance.now();
     worker.postMessage({ code });
 
     worker.onmessage = e => {
         output.value = e.data.code;
-        sTime.textContent = Math.round(performance.now() - start) + 'ms';
-        sSize.textContent = e.data.code.length + ' B';
+        timeEl.textContent = Math.round(performance.now() - start) + 'ms';
+        sizeEl.textContent = e.data.code.length + ' B';
         btn.disabled = false;
-        btn.textContent = 'Obfuscate';
+        btn.textContent = 'OBFUSCATE';
     };
 };
 </script>
