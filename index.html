@@ -2,11 +2,9 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>Oclare Obfuscator V1.0</title>
+<title>Oclare Obfuscator V2.0</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Orbitron:wght@600;800&display=swap" rel="stylesheet">
-
 <style>
 :root{
     --bg:#050508;
@@ -65,15 +63,43 @@ header{
     display:flex;
     flex-direction:column;
 }
-.panel h3{
-    margin:0;
+.panel-header{
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
     padding:10px 14px;
+    background:var(--panel2);
+    border-bottom:1px solid var(--border);
+}
+.panel-header h3{
+    margin:0;
     font-size:11px;
     letter-spacing:2px;
     color:var(--muted);
-    background:var(--panel2);
-    border-bottom:1px solid var(--border);
     text-transform:uppercase;
+}
+.panel-actions{
+    display:flex;
+    gap:6px;
+}
+.panel-actions button{
+    padding:4px 10px;
+    font-size:10px;
+    letter-spacing:1px;
+    border-radius:6px;
+    background:var(--border);
+    color:var(--muted);
+    box-shadow:none;
+    animation:none;
+    transition:all 0.2s;
+}
+.panel-actions button:hover{
+    background:var(--primary);
+    color:#fff;
+}
+.panel-actions button.copied{
+    background:var(--success);
+    color:#000;
 }
 textarea{
     flex:1;
@@ -84,6 +110,7 @@ textarea{
     font-size:12px;
     resize:none;
     outline:none;
+    min-height:300px;
 }
 textarea::placeholder{color:#555}
 textarea.output{
@@ -96,6 +123,12 @@ textarea.output{
     justify-content:space-between;
     align-items:center;
     gap:10px;
+    flex-wrap:wrap;
+}
+.controls-left{
+    display:flex;
+    align-items:center;
+    gap:12px;
 }
 button{
     padding:14px 28px;
@@ -119,6 +152,28 @@ button:disabled{
     0%,100%{background-position:0% 50%}
     50%{background-position:100% 50%}
 }
+.progress-bar{
+    display:none;
+    width:200px;
+    height:6px;
+    background:var(--border);
+    border-radius:3px;
+    overflow:hidden;
+}
+.progress-bar.active{display:block}
+.progress-fill{
+    height:100%;
+    width:0%;
+    background:linear-gradient(90deg,var(--primary),var(--accent));
+    border-radius:3px;
+    transition:width 0.3s;
+}
+.progress-label{
+    font-size:10px;
+    color:var(--muted);
+    display:none;
+}
+.progress-label.active{display:block}
 .stats{
     display:flex;
     gap:16px;
@@ -144,25 +199,37 @@ footer{
 
 <header>
     <div class="logo">OCLARE</div>
-    <div class="tag">V1.0 · Lua VM Obfuscator</div>
+    <div class="tag">V2.0 · Lua VM Obfuscator</div>
 </header>
 
 <div class="container">
 
     <div class="grid">
         <div class="panel">
-            <h3>Input Lua</h3>
+            <div class="panel-header">
+                <h3>Input Lua</h3>
+            </div>
             <textarea id="input" placeholder="print('hello world')"></textarea>
         </div>
 
         <div class="panel">
-            <h3>Obfuscated Output</h3>
+            <div class="panel-header">
+                <h3>Obfuscated Output</h3>
+                <div class="panel-actions">
+                    <button id="copyBtn" onclick="copyOutput()">COPY</button>
+                    <button id="dlBtn" onclick="downloadOutput()">DOWNLOAD</button>
+                </div>
+            </div>
             <textarea id="output" class="output" readonly placeholder="Protected code appears here..."></textarea>
         </div>
     </div>
 
     <div class="controls">
-        <button id="obfBtn">OBFUSCATE</button>
+        <div class="controls-left">
+            <button id="obfBtn">OBFUSCATE</button>
+            <div class="progress-bar" id="progressBar"><div class="progress-fill" id="progressFill"></div></div>
+            <div class="progress-label" id="progressLabel"></div>
+        </div>
         <div class="stats">
             <div class="stat">Time: <span id="time">0ms</span></div>
             <div class="stat">Size: <span id="size">0 B</span></div>
@@ -172,7 +239,7 @@ footer{
 </div>
 
 <footer>
-    Oclare Obfuscator · Made by hippo :D · V1
+    Oclare Obfuscator · Made by hippo :D · V2
 </footer>
 
 <script>
@@ -182,42 +249,85 @@ const output = document.getElementById('output');
 const btn = document.getElementById('obfBtn');
 const timeEl = document.getElementById('time');
 const sizeEl = document.getElementById('size');
+const progressBar = document.getElementById('progressBar');
+const progressFill = document.getElementById('progressFill');
+const progressLabel = document.getElementById('progressLabel');
+
+let start = 0;
 
 btn.onclick = () => {
     const code = input.value.trim();
     if(!code) return;
 
     btn.disabled = true;
-    btn.textContent = 'PROCESSING…';
+    btn.textContent = 'PROCESSING\u2026';
+    progressBar.classList.add('active');
+    progressLabel.classList.add('active');
+    progressFill.style.width = '0%';
+    progressLabel.textContent = 'Initializing...';
 
-    const start = performance.now();
-    
-    worker.onerror = (error) => {
-        output.value = 'Worker error: ' + error.message;
-        btn.disabled = false;
-        btn.textContent = 'OBFUSCATE';
-    };
-    
-    worker.postMessage({ 
+    start = performance.now();
+
+    worker.postMessage({
         type: 'poly',
         code: code,
         id: 'main'
     });
-
-    worker.onmessage = e => {
-        if (e.data.type === 'poly-result') {
-            output.value = e.data.code;
-            timeEl.textContent = Math.round(performance.now() - start) + 'ms';
-            sizeEl.textContent = e.data.code.length + ' B';
-            btn.disabled = false;
-            btn.textContent = 'OBFUSCATE';
-        } else if (e.data.type === 'error') {
-            output.value = 'Error: ' + e.data.error;
-            btn.disabled = false;
-            btn.textContent = 'OBFUSCATE';
-        }
-    };
 };
+
+worker.onmessage = e => {
+    const d = e.data;
+    if (d.type === 'progress') {
+        progressFill.style.width = d.pct + '%';
+        progressLabel.textContent = d.msg;
+    } else if (d.type === 'poly-result') {
+        output.value = d.code;
+        timeEl.textContent = Math.round(performance.now() - start) + 'ms';
+        const bytes = new Blob([d.code]).size;
+        sizeEl.textContent = bytes > 1024 ? (bytes/1024).toFixed(1)+' KB' : bytes+' B';
+        finish();
+    } else if (d.type === 'error') {
+        output.value = 'Error: ' + d.error;
+        finish();
+    }
+};
+
+worker.onerror = (error) => {
+    output.value = 'Worker error: ' + error.message;
+    finish();
+};
+
+function finish() {
+    btn.disabled = false;
+    btn.textContent = 'OBFUSCATE';
+    progressBar.classList.remove('active');
+    progressLabel.classList.remove('active');
+}
+
+function copyOutput() {
+    const text = output.value;
+    if (!text) return;
+    navigator.clipboard.writeText(text).then(() => {
+        const b = document.getElementById('copyBtn');
+        b.textContent = 'COPIED';
+        b.classList.add('copied');
+        setTimeout(() => { b.textContent = 'COPY'; b.classList.remove('copied'); }, 1500);
+    });
+}
+
+function downloadOutput() {
+    const text = output.value;
+    if (!text) return;
+    const blob = new Blob([text], {type:'text/plain'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'obfuscated.lua';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+}
 </script>
 
 </body>
