@@ -604,7 +604,6 @@ const IROp = {
     FOR_PREP: 'FOR_PREP', FOR_LOOP: 'FOR_LOOP', TFOR_CALL: 'TFOR_CALL', TFOR_LOOP: 'TFOR_LOOP',
     DUP: 'DUP', POP: 'POP', SWAP: 'SWAP', ROT3: 'ROT3',
     ENTER_SCOPE: 'ENTER_SCOPE', EXIT_SCOPE: 'EXIT_SCOPE',
-    INTEGRITY_CHECK: 'INTEGRITY_CHECK', TIMING_CHECK: 'TIMING_CHECK',
     NOP: 'NOP', HALT: 'HALT'
 };
 
@@ -617,6 +616,8 @@ class IRBuilder {
         this.labelCounter = 0;
         this.loopStack = [];
         this.closures = [];
+        this.userLabels = {};
+        this.pendingGotos = [];
     }
 
     ir(op, args = {}) {
@@ -660,13 +661,13 @@ class IRBuilder {
     }
 
     lower(ast) {
-        this.ir(IROp.INTEGRITY_CHECK, { kind: 'debug' });
-        this.ir(IROp.INTEGRITY_CHECK, { kind: 'env' });
-        this.ir(IROp.INTEGRITY_CHECK, { kind: 'hook' });
-        this.ir(IROp.INTEGRITY_CHECK, { kind: 'emu' });
-        this.ir(IROp.INTEGRITY_CHECK, { kind: 'sandbox' });
         this.lowerNode(ast);
         this.ir(IROp.HALT);
+        for (const g of this.pendingGotos) {
+            const target = this.userLabels[g.label];
+            if (!target) throw new Error(`Undefined label: ${g.label}`);
+            this.instructions[g.instrIdx] = { op: IROp.JUMP, label: target };
+        }
         return { instructions: this.instructions, constants: this.constants, closures: this.closures };
     }
 
@@ -774,7 +775,6 @@ class IRBuilder {
         const contLabel = this.newLabel();
         this.loopStack.push({ breakLabel: endLabel, continueLabel: contLabel });
         this.placeLabel(loopLabel);
-        this.ir(IROp.TIMING_CHECK);
         this.lowerNode(node.condition);
         this.ir(IROp.JUMP_FALSE, { label: endLabel });
         this.lowerNode(node.body);
@@ -790,7 +790,6 @@ class IRBuilder {
         const contLabel = this.newLabel();
         this.loopStack.push({ breakLabel: endLabel, continueLabel: contLabel });
         this.placeLabel(loopLabel);
-        this.ir(IROp.TIMING_CHECK);
         this.lowerNode(node.body);
         this.placeLabel(contLabel);
         this.lowerNode(node.condition);
@@ -817,7 +816,6 @@ class IRBuilder {
         const contLabel = this.newLabel();
         this.loopStack.push({ breakLabel: endLabel, continueLabel: contLabel });
         this.placeLabel(loopLabel);
-        this.ir(IROp.TIMING_CHECK);
         const varIdx = this.resolveLocal(node.var);
         const limitIdx = this.resolveLocal('(limit)');
         const stepIdx = this.resolveLocal('(step)');
@@ -849,15 +847,12 @@ class IRBuilder {
         this.ir(IROp.STORE_LOCAL, { index: this.resolveLocal('(state)') });
         this.addLocal('(control)');
         this.ir(IROp.STORE_LOCAL, { index: this.resolveLocal('(control)') });
-        for (const name of node.names) {
-            this.addLocal(name);
-        }
+        for (const name of node.names) this.addLocal(name);
         const loopLabel = this.newLabel();
         const endLabel = this.newLabel();
         const contLabel = this.newLabel();
         this.loopStack.push({ breakLabel: endLabel, continueLabel: contLabel });
         this.placeLabel(loopLabel);
-        this.ir(IROp.TIMING_CHECK);
         const iterIdx = this.resolveLocal('(iter)');
         const stateIdx = this.resolveLocal('(state)');
         const controlIdx = this.resolveLocal('(control)');
@@ -895,8 +890,20 @@ class IRBuilder {
         this.ir(IROp.JUMP, { label: this.loopStack[this.loopStack.length - 1].continueLabel });
     }
 
-    lower_Label() {}
-    lower_Goto() {}
+    lower_Label(node) {
+        const irLabel = this.newLabel();
+        this.userLabels[node.name] = irLabel;
+        this.placeLabel(irLabel);
+    }
+
+    lower_Goto(node) {
+        if (this.userLabels[node.label]) {
+            this.ir(IROp.JUMP, { label: this.userLabels[node.label] });
+        } else {
+            const instrIdx = this.ir(IROp.NOP);
+            this.pendingGotos.push({ label: node.label, instrIdx });
+        }
+    }
 
     lower_ExpressionStatement(node) {
         this.lowerNode(node.expression);
@@ -1056,18 +1063,153 @@ class IRBuilder {
     lower_Vararg() { this.ir(IROp.VARARG); }
 }
 
+class IROptimizer {
+    optimize(ir) {
+        let changed = true;
+        let instructions = ir.instructions;
+        let constants = ir.constants;
+        while (changed) {
+            changed = false;
+            const r1 = this.constantFold(instructions, constants);
+            if (r1.changed) { changed = true; instructions = r1.instructions; constants = r1.constants; }
+            const r2 = this.peephole(instructions);
+            if (r2.changed) { changed = true; instructions = r2.instructions; }
+            const r3 = this.deadCodeElim(instructions);
+            if (r3.changed) { changed = true; instructions = r3.instructions; }
+        }
+        return { instructions, constants, closures: ir.closures };
+    }
+
+    constantFold(instructions, constants) {
+        let changed = false;
+        const result = [];
+        for (let i = 0; i < instructions.length; i++) {
+            const inst = instructions[i];
+            if (i >= 2) {
+                const prev2 = result[result.length - 2];
+                const prev1 = result[result.length - 1];
+                if (prev2 && prev1 && prev2.op === IROp.LOAD_CONST && prev1.op === IROp.LOAD_CONST) {
+                    const a = constants[prev2.constIdx];
+                    const b = constants[prev1.constIdx];
+                    if (typeof a === 'number' && typeof b === 'number') {
+                        let folded = null;
+                        if (inst.op === IROp.ADD) folded = a + b;
+                        else if (inst.op === IROp.SUB) folded = a - b;
+                        else if (inst.op === IROp.MUL) folded = a * b;
+                        else if (inst.op === IROp.DIV && b !== 0) folded = a / b;
+                        else if (inst.op === IROp.MOD && b !== 0) folded = a % b;
+                        else if (inst.op === IROp.POW) folded = Math.pow(a, b);
+                        else if (inst.op === IROp.IDIV && b !== 0) folded = Math.floor(a / b);
+                        if (folded !== null && Number.isFinite(folded)) {
+                            result.pop();
+                            result.pop();
+                            let ci = constants.indexOf(folded);
+                            if (ci === -1) { ci = constants.length; constants.push(folded); }
+                            result.push({ op: IROp.LOAD_CONST, constIdx: ci });
+                            changed = true;
+                            continue;
+                        }
+                    }
+                }
+            }
+            if (inst.op === IROp.NEGATE && result.length > 0) {
+                const prev = result[result.length - 1];
+                if (prev && prev.op === IROp.LOAD_CONST && typeof constants[prev.constIdx] === 'number') {
+                    result.pop();
+                    const val = -constants[prev.constIdx];
+                    let ci = constants.indexOf(val);
+                    if (ci === -1) { ci = constants.length; constants.push(val); }
+                    result.push({ op: IROp.LOAD_CONST, constIdx: ci });
+                    changed = true;
+                    continue;
+                }
+            }
+            if (inst.op === IROp.NOT && result.length > 0) {
+                const prev = result[result.length - 1];
+                if (prev && prev.op === IROp.LOAD_TRUE) { result.pop(); result.push({ op: IROp.LOAD_FALSE }); changed = true; continue; }
+                if (prev && prev.op === IROp.LOAD_FALSE) { result.pop(); result.push({ op: IROp.LOAD_TRUE }); changed = true; continue; }
+            }
+            result.push(inst);
+        }
+        return { instructions: result, constants, changed };
+    }
+
+    peephole(instructions) {
+        let changed = false;
+        const result = [];
+        for (let i = 0; i < instructions.length; i++) {
+            const inst = instructions[i];
+            if (result.length > 0) {
+                const prev = result[result.length - 1];
+                if (prev.op === IROp.LOAD_LOCAL && inst.op === IROp.STORE_LOCAL && prev.index === inst.index) {
+                    result.pop();
+                    changed = true;
+                    continue;
+                }
+                if (prev.op === IROp.STORE_LOCAL && inst.op === IROp.LOAD_LOCAL && prev.index === inst.index) {
+                    result.push({ op: IROp.DUP });
+                    result.push(prev);
+                    result.pop();
+                    result.pop();
+                    result.push(prev);
+                    continue;
+                }
+                if (prev.op === IROp.JUMP && inst.op === IROp.LABEL && prev.label === inst.name) {
+                    result.pop();
+                    result.push(inst);
+                    changed = true;
+                    continue;
+                }
+            }
+            result.push(inst);
+        }
+        return { instructions: result, changed };
+    }
+
+    deadCodeElim(instructions) {
+        let changed = false;
+        const labels = new Set();
+        for (const inst of instructions) {
+            if (inst.op === IROp.JUMP || inst.op === IROp.JUMP_TRUE || inst.op === IROp.JUMP_FALSE || inst.op === IROp.JUMP_NIL) {
+                if (inst.label) labels.add(inst.label);
+            }
+        }
+        const result = [];
+        let dead = false;
+        for (const inst of instructions) {
+            if (inst.op === IROp.LABEL) {
+                if (labels.has(inst.name) || !dead) {
+                    dead = false;
+                    result.push(inst);
+                } else {
+                    result.push(inst);
+                }
+                dead = false;
+                continue;
+            }
+            if (dead) { changed = true; continue; }
+            result.push(inst);
+            if (inst.op === IROp.JUMP || inst.op === IROp.RETURN || inst.op === IROp.HALT) {
+                dead = true;
+            }
+        }
+        return { instructions: result, changed };
+    }
+}
+
 class BytecodeCompiler {
     constructor(vmArch, target) {
         this.vmArch = vmArch;
         this.target = target;
         this.features = LuaFeatures[target];
+        this.usedOps = new Set();
     }
 
     compile(irResult) {
         const mainBc = this._compileIR(irResult.instructions, irResult.constants);
         const compiledClosures = this._compileClosures(irResult.closures);
         const allConstants = this._mergeClosureConstants(irResult.constants, compiledClosures);
-        return { bytecode: mainBc.bytecode, constants: allConstants };
+        return { bytecode: mainBc.bytecode, constants: allConstants, usedOps: this.usedOps };
     }
 
     _compileClosures(closures) {
@@ -1093,16 +1235,15 @@ class BytecodeCompiler {
 
     _compileIR(instructions, constants) {
         const bytecode = [];
-        const config = this.vmArch.activeConfig;
+        const config = this.vmArch.config;
         const labelPositions = {};
         const patchList = [];
 
         const emitByte = (b) => { bytecode.push(b & 0xFF); };
-        const emitOp = (opName) => { emitByte(this.vmArch.getOpcode(opName)); };
+        const emitOp = (opName) => { this.usedOps.add(opName); emitByte(this.vmArch.getOpcode(opName)); };
 
         const encodeImmediate = (val) => {
-            val = (val ^ config.immediateKey) >>> 0;
-            return val;
+            return (val ^ config.immediateKey) >>> 0;
         };
 
         const emitWord = (val) => {
@@ -1118,8 +1259,7 @@ class BytecodeCompiler {
         };
 
         const patchJump = (pos, target) => {
-            let val = target;
-            if (config.jumpRelative) val = (target - pos - 4);
+            let val = config.jumpRelative ? (target - pos - 4) : target;
             val = (val ^ config.jumpKey) >>> 0;
             if (config.endianness === 'little') { bytecode[pos] = val & 0xFF; bytecode[pos + 1] = (val >> 8) & 0xFF; bytecode[pos + 2] = (val >> 16) & 0xFF; bytecode[pos + 3] = (val >> 24) & 0xFF; }
             else { bytecode[pos] = (val >> 24) & 0xFF; bytecode[pos + 1] = (val >> 16) & 0xFF; bytecode[pos + 2] = (val >> 8) & 0xFF; bytecode[pos + 3] = val & 0xFF; }
@@ -1151,9 +1291,7 @@ class BytecodeCompiler {
                 case IROp.LOAD_LOCAL:
                     emitOp('LDLOC'); emitByte(inst.index & 0xFF); break;
                 case IROp.STORE_LOCAL:
-                    if (inst.fromTfor) { emitOp('STLOC'); emitByte(inst.index & 0xFF); }
-                    else { emitOp('STLOC'); emitByte(inst.index & 0xFF); }
-                    break;
+                    emitOp('STLOC'); emitByte(inst.index & 0xFF); break;
                 case IROp.LOAD_GLOBAL:
                     emitOp('LDGLOB'); emitWord(inst.constIdx); break;
                 case IROp.STORE_GLOBAL:
@@ -1185,13 +1323,6 @@ class BytecodeCompiler {
                     emitOp('RET'); emitByte(inst.count & 0xFF); break;
                 case IROp.CLOSURE:
                     emitOp('CLOS'); emitWord(inst.constIdx); break;
-                case IROp.INTEGRITY_CHECK: {
-                    const kindMap = { debug: 'CHKDBG', env: 'CHKENV', hook: 'ANTIHOOK', emu: 'CHKEMU', sandbox: 'CHKSBOX' };
-                    emitOp(kindMap[inst.kind] || 'NOP');
-                    break;
-                }
-                case IROp.TIMING_CHECK:
-                    emitOp('CHKTIM'); break;
             }
         }
 
@@ -1291,20 +1422,15 @@ class CryptoSystem {
         }
         const realLen = bytes.length;
         bytes.unshift(realLen & 0xFF, (realLen >> 8) & 0xFF, (realLen >> 16) & 0xFF, (realLen >> 24) & 0xFF);
-        const padTarget = Math.ceil((bytes.length) / 32) * 32 + this.buildConfig.seededRandomInt(0, 3) * 32;
+        const padTarget = Math.ceil((bytes.length) / 16) * 16 + this.buildConfig.seededRandomInt(0, 2) * 16;
         while (bytes.length < padTarget) bytes.push(this.buildConfig.seededRandomInt(0, 255));
         return this.encrypt(bytes);
     }
 
-    encryptHandlers(handlerStr, keyBytes, opcode) {
+    encryptBlob(str) {
         const data = [];
-        for (let i = 0; i < handlerStr.length; i++) data.push(handlerStr.charCodeAt(i) & 0xFF);
-        const nonce = new Uint8Array(12);
-        const salt = this.buildConfig.runtimeSalt();
-        nonce[0] = (opcode ^ salt) & 0xFF;
-        nonce[1] = ((opcode >> 8) ^ (salt >> 8)) & 0xFF;
-        for (let i = 2; i < 12; i++) nonce[i] = keyBytes[(i * 7 + opcode) % keyBytes.length] ^ ((salt >> ((i % 4) * 8)) & 0xFF);
-        return { data: this._chacha20Encrypt(data, keyBytes, Array.from(nonce)), nonce: Array.from(nonce) };
+        for (let i = 0; i < str.length; i++) data.push(str.charCodeAt(i) & 0xFF);
+        return this.encrypt(data);
     }
 }
 
@@ -1312,27 +1438,6 @@ class IntegritySystem {
     constructor(buildConfig) {
         this.buildConfig = buildConfig;
         this.seed = buildConfig.generateKey(32);
-        this.polyA = buildConfig.generateKey(32) | 1;
-        this.polyB = buildConfig.generateKey(32);
-        this.polyM = 0xFFFFFFFB;
-        this.probeConstants = [];
-        for (let i = 0; i < 8; i++) this.probeConstants.push(buildConfig.generateKey(32));
-    }
-
-    computeExpectedIntegrityModifier() {
-        let modifier = 0;
-        for (let i = 0; i < this.probeConstants.length; i++) modifier = (modifier ^ this.probeConstants[i]) >>> 0;
-        return modifier;
-    }
-
-    maskHandlerKey(realKeyBytes) {
-        const modifier = this.computeExpectedIntegrityModifier();
-        const masked = [];
-        for (let i = 0; i < realKeyBytes.length; i++) {
-            const modByte = (modifier >>> ((i % 4) * 8)) & 0xFF;
-            masked.push((realKeyBytes[i] ^ modByte) & 0xFF);
-        }
-        return masked;
     }
 
     computeChecksum(data) {
@@ -1361,132 +1466,29 @@ class IntegritySystem {
         return { h1: h1 >>> 0, h2: h2 >>> 0, h3: h3 >>> 0, h4: h4 >>> 0 };
     }
 
-    generateAntiDebug() {
-        const v = this.buildConfig.generateId(4);
-        const lines = [];
-        lines.push(`local ${v}_t0=os.clock and os.clock() or 0`);
-        lines.push(`local ${v}_dbg=false`);
-        lines.push(`if debug and debug.getinfo then local i=debug.getinfo(1) if i and i.what=="C" then ${v}_dbg=true end end`);
-        lines.push(`if debug and debug.sethook then local h=debug.gethook and debug.gethook() if h then ${v}_dbg=true end end`);
-        lines.push(`if _G.jit and _G.jit.status and not _G.jit.status() then ${v}_dbg=true end`);
-        lines.push(`local function ${v}_tck() local t=os.clock and os.clock() or 0 if t-${v}_t0>0.1 then return false end ${v}_t0=t return true end`);
-        this._antiDebugVar = `${v}_dbg`;
-        this._tickFn = `${v}_tck`;
-        return lines.join('\n');
+    deriveHandlerKey(bytecodeBytes, baseKey) {
+        const cs = this.computeChecksum(bytecodeBytes);
+        const derived = [];
+        for (let i = 0; i < baseKey.length; i++) {
+            const csWord = [cs.h1, cs.h2, cs.h3, cs.h4][Math.floor(i / 8) % 4];
+            const csByte = (csWord >>> ((i % 4) * 8)) & 0xFF;
+            derived.push((baseKey[i] ^ csByte) & 0xFF);
+        }
+        return derived;
     }
 
-    generateEnvCheck() {
-        const v = this.buildConfig.generateId(4);
-        const lines = [];
-        lines.push(`local ${v}_env={}`);
-        lines.push(`local ${v}_efn={"print","pairs","ipairs","next","type","tostring","tonumber","select","rawget","rawset","rawequal","getmetatable","setmetatable","pcall","xpcall","error","assert","loadstring","load","dofile","loadfile","require","module","unpack","table","string","math","coroutine","io","os","debug","package"}`);
-        lines.push(`for _,k in ipairs(${v}_efn) do if _G[k] then ${v}_env[k]=tostring(_G[k]) end end`);
-        lines.push(`local function ${v}_venv() for k,v in pairs(${v}_env) do if not _G[k] or tostring(_G[k])~=v then return false end end return true end`);
-        this._envCheckFn = `${v}_venv`;
-        return lines.join('\n');
-    }
-
-    generateHookDetection() {
-        const v = this.buildConfig.generateId(4);
-        const lines = [];
-        lines.push(`local ${v}_mts={}`);
-        lines.push(`local ${v}_tbs={string=string,table=table,math=math}`);
-        lines.push(`for n,t in pairs(${v}_tbs) do local mt=getmetatable(t) ${v}_mts[n]=mt and tostring(mt) or "nil" end`);
-        lines.push(`local function ${v}_vhk()`);
-        lines.push(`for n,t in pairs(${v}_tbs) do local mt=getmetatable(t) local s=mt and tostring(mt) or "nil" if s~=${v}_mts[n] then return false end end`);
-        lines.push(`if debug and debug.getmetatable then for n,t in pairs(${v}_tbs) do local mt=debug.getmetatable(t) if mt and not ${v}_mts[n]:find("nil") then return false end end end`);
-        lines.push(`return true end`);
-        this._hookCheckFn = `${v}_vhk`;
-        return lines.join('\n');
-    }
-
-    generateAntiEmulation() {
-        const v = this.buildConfig.generateId(4);
-        const lines = [];
-        lines.push(`local ${v}_emu=false`);
-        lines.push(`local function ${v}_chkemu()`);
-        lines.push(`if os.getenv then`);
-        lines.push(`local ev={"QEMU_AUDIO_DRV","DOCKER_HOST","container","KUBERNETES_SERVICE_HOST","WINE","WINEPREFIX","WINEDEBUG","WINELOADER","SANDBOX","SANDBOXIE","CUCKOO"}`);
-        lines.push(`for _,e in ipairs(ev) do if os.getenv(e) then return true end end`);
-        lines.push(`end`);
-        lines.push(`if io and io.open then`);
-        lines.push(`local vf={"/.dockerenv","/proc/1/cgroup","/proc/self/status","/.flatpak-info"}`);
-        lines.push(`for _,f in ipairs(vf) do local h=io.open(f,"r") if h then local c=h:read("*a") or "" h:close()`);
-        lines.push(`if c:find("docker") or c:find("lxc") or c:find("kubepods") or c:find("qemu") or c:find("kvm") or c:find("vbox") or c:find("vmware") or c:find("hyperv") then return true end end end`);
-        lines.push(`end`);
-        lines.push(`if os.execute then local r=os.execute("grep -q hypervisor /proc/cpuinfo 2>/dev/null") if r==true or r==0 then return true end end`);
-        lines.push(`return false end`);
-        lines.push(`${v}_emu=${v}_chkemu()`);
-        this._emuVar = `${v}_emu`;
-        return lines.join('\n');
-    }
-
-    generateSandboxDetection() {
-        const v = this.buildConfig.generateId(4);
-        const lines = [];
-        lines.push(`local ${v}_sbox=false`);
-        lines.push(`local function ${v}_chksbox()`);
-        lines.push(`local start=os.clock and os.clock() or 0`);
-        lines.push(`local sum=0 for i=1,500000 do sum=sum+i end`);
-        lines.push(`local elapsed=os.clock and (os.clock()-start) or 0`);
-        lines.push(`if elapsed>0.5 then return true end`);
-        lines.push(`if elapsed<0.001 and sum>0 then return true end`);
-        lines.push(`local m1=collectgarbage("count")`);
-        lines.push(`local t={} for i=1,10000 do t[i]=string.rep("x",100) end`);
-        lines.push(`local m2=collectgarbage("count") t=nil collectgarbage("collect")`);
-        lines.push(`if (m2-m1)<100 then return true end`);
-        lines.push(`if debug and debug.getinfo then local info=debug.getinfo(1) if info and info.source and info.source:find("sandbox") then return true end end`);
-        lines.push(`if os.getenv then`);
-        lines.push(`local se={"ANALYSIS","MALWARE","VIRUS","SANDBOX","CUCKOO","ANUBIS","THREAT","JOEBOX"}`);
-        lines.push(`for _,e in ipairs(se) do for k,vl in pairs(os.getenv() or {}) do if type(k)=="string" and k:upper():find(e) then return true end end end`);
-        lines.push(`end`);
-        lines.push(`return false end`);
-        lines.push(`${v}_sbox=${v}_chksbox()`);
-        this._sboxVar = `${v}_sbox`;
-        return lines.join('\n');
-    }
-
-    generateTimingCheck() {
-        const v = this.buildConfig.generateId(4);
-        const lines = [];
-        lines.push(`local ${v}_tok=true`);
-        lines.push(`local function ${v}_chkt()`);
-        lines.push(`local samples={} for i=1,5 do local t1=os.clock and os.clock() or 0 local x=0 for j=1,10000 do x=x+j end`);
-        lines.push(`local t2=os.clock and os.clock() or 0 samples[i]=t2-t1 end`);
-        lines.push(`local avg=0 for i=1,5 do avg=avg+samples[i] end avg=avg/5`);
-        lines.push(`local variance=0 for i=1,5 do variance=variance+(samples[i]-avg)^2 end variance=variance/5`);
-        lines.push(`if variance>avg*10 then return false end`);
-        lines.push(`if avg>0.1 then return false end`);
-        lines.push(`return true end`);
-        lines.push(`${v}_tok=${v}_chkt()`);
-        this._timingVar = `${v}_tok`;
-        return lines.join('\n');
-    }
-
-    generateIntegrityKeyDerivation(maskedKeyBytes) {
-        const v = this.buildConfig.generateId(4);
-        const probes = [
-            { check: 'type(print)=="function"', pc: this.probeConstants[0] },
-            { check: 'type(pairs)=="function"', pc: this.probeConstants[1] },
-            { check: 'type(tostring)=="function"', pc: this.probeConstants[2] },
-            { check: 'type(tonumber)=="function"', pc: this.probeConstants[3] },
-            { check: 'type(math)=="table"', pc: this.probeConstants[4] },
-            { check: 'type(string)=="table"', pc: this.probeConstants[5] },
-            { check: 'type(table)=="table"', pc: this.probeConstants[6] },
-            { check: 'type(coroutine)=="table"', pc: this.probeConstants[7] }
-        ];
-        const lines = [];
-        lines.push(`local ${v}_hke={${maskedKeyBytes.join(',')}}`);
-        lines.push(`local ${v}_ikm=0`);
-        for (const p of probes) lines.push(`if ${p.check} then ${v}_ikm=bit_xor(${v}_ikm,${p.pc}) end`);
-        lines.push(`local ${v}_hkd={}`);
-        lines.push(`for i=1,#${v}_hke do local mb=bit_and(bit_rshift(${v}_ikm,((i-1)%4)*8),0xFF) ${v}_hkd[i]=bit_xor(${v}_hke[i],mb) end`);
-        this._derivedKeyVar = `${v}_hkd`;
-        return lines.join('\n');
-    }
-
-    getGuardCondition() {
-        return `not ${this._antiDebugVar} and not ${this._emuVar} and not ${this._sboxVar} and ${this._timingVar} and ${this._envCheckFn}() and ${this._hookCheckFn}()`;
+    splitKey(keyBytes) {
+        const shares = [[], [], [], []];
+        const mask1 = this.buildConfig.generateBytes(keyBytes.length);
+        const mask2 = this.buildConfig.generateBytes(keyBytes.length);
+        const mask3 = this.buildConfig.generateBytes(keyBytes.length);
+        for (let i = 0; i < keyBytes.length; i++) {
+            shares[0].push(mask1[i]);
+            shares[1].push(mask2[i]);
+            shares[2].push(mask3[i]);
+            shares[3].push((keyBytes[i] ^ mask1[i] ^ mask2[i] ^ mask3[i]) & 0xFF);
+        }
+        return shares;
     }
 }
 
@@ -1495,70 +1497,45 @@ class VMArchitect {
         this.buildConfig = buildConfig;
         this.target = target;
         this.features = LuaFeatures[target];
-        this.selectedVM = this.buildConfig.seededRandomInt(0, 11);
-        this.vmConfigs = this.generateVMConfigs();
-        this.activeConfig = this.vmConfigs[this.selectedVM];
-        this.generateOpcodeLayout();
-    }
-
-    generateVMConfigs() {
-        const configs = [];
-        const archetypes = [
-            { name: 'STACK_LE', style: 'stack' }, { name: 'STACK_BE', style: 'stack' },
-            { name: 'ACCUM_A', style: 'accumulator' }, { name: 'REG4_LE', style: 'register' },
-            { name: 'REG8_BE', style: 'register' }, { name: 'HYBRID4', style: 'hybrid' },
-            { name: 'HYBRID8', style: 'hybrid' }, { name: 'THREADED', style: 'threaded' },
-            { name: 'SWITCHED', style: 'switched' }, { name: 'DUALSTK', style: 'dual_stack' },
-            { name: 'TAGGED', style: 'tagged' }, { name: 'COMPACT', style: 'compact' }
-        ];
-        for (let i = 0; i < 12; i++) {
-            const arch = archetypes[i];
-            configs.push({
-                id: i, name: arch.name, style: arch.style,
-                key: this.buildConfig.generateKey(32),
-                nonce: this.buildConfig.generateBytes(24),
-                opcodeOffset: this.buildConfig.seededRandomInt(0, 127),
-                endianness: this.buildConfig.seededRandomInt(0, 1) === 0 ? 'little' : 'big',
-                wordSize: 4,
-                dispatchStyle: ['switch', 'table', 'computed'][this.buildConfig.seededRandomInt(0, 2)],
-                handlerKey: this.buildConfig.generateKey(32),
-                handlerNonce: this.buildConfig.generateBytes(16),
-                immediateKey: this.buildConfig.generateKey(32),
-                jumpKey: this.buildConfig.generateKey(32),
-                jumpRelative: this.buildConfig.seededRandom() > 0.5,
-                invertConditionals: this.buildConfig.seededRandom() > 0.5,
-                popOrderSwap: this.buildConfig.seededRandom() > 0.5,
-                addTransform: this.buildConfig.seededRandomInt(0, 3),
-                subTransform: this.buildConfig.seededRandomInt(0, 3),
-                mulTransform: this.buildConfig.seededRandomInt(0, 2),
-                addMask: this.buildConfig.generateKey(16) & 0xFFFF,
-                xorSeed: this.buildConfig.generateKey(32),
-                stackDirection: this.buildConfig.seededRandomInt(0, 1) === 0 ? 'up' : 'down',
-                callConvention: ['stack', 'reversed'][this.buildConfig.seededRandomInt(0, 1)],
-                rekeyInterval: this.buildConfig.seededRandomInt(8, 32),
-                selfModifyRate: this.buildConfig.seededRandom() * 0.3 + 0.1,
-                oneshotOpcodes: this.buildConfig.shuffleArray([0,1,2,3,4,5,6,7]).slice(0, this.buildConfig.seededRandomInt(2, 5)),
-                smXorMask: this.buildConfig.seededRandomInt(1, 255)
-            });
-        }
-        return configs;
-    }
-
-    generateOpcodeLayout() {
+        this.config = this._generateConfig();
         this.opcodeMap = {};
         this.reverseMap = {};
+        this.fakeOpcodes = [];
+        this._generateOpcodeLayout();
+    }
+
+    _generateConfig() {
+        return {
+            opcodeOffset: this.buildConfig.seededRandomInt(0, 127),
+            endianness: this.buildConfig.seededRandom() > 0.5 ? 'little' : 'big',
+            immediateKey: this.buildConfig.generateKey(32),
+            jumpKey: this.buildConfig.generateKey(32),
+            jumpRelative: this.buildConfig.seededRandom() > 0.5,
+            invertConditionals: this.buildConfig.seededRandom() > 0.5,
+            popOrderSwap: this.buildConfig.seededRandom() > 0.5,
+            xorSeed: this.buildConfig.generateKey(32),
+            callConvention: ['stack', 'reversed'][this.buildConfig.seededRandomInt(0, 1)],
+            rekeyInterval: this.buildConfig.seededRandomInt(16, 64),
+            smXorKeys: [
+                this.buildConfig.seededRandomInt(1, 255),
+                this.buildConfig.seededRandomInt(1, 255),
+                this.buildConfig.seededRandomInt(1, 255)
+            ]
+        };
+    }
+
+    _generateOpcodeLayout() {
         const allOps = [
             'ADD','SUB','MUL','DIV','MOD','POW','IDIV','UNM',
-            'PUSH','POP','DUP','SWAP','ROT3','PICK','DROP',
+            'POP','DUP','SWAP','ROT3',
             'JMP','JT','JF','JNIL','LOOP','TFOR',
             'LDLOC','STLOC','LDGLOB','STGLOB','LDUP','STUP','NEWTBL','GETTBL','SETTBL',
-            'CALL','TCALL','RET','CLOS','SELF','MRET',
+            'CALL','RET','CLOS','SELF','MRET',
             'INITLOC',
             'EQ','NEQ','LT','LE','GT','GE',
             'BAND','BOR','BXOR','BNOT','SHL','SHR',
             'LDK','LDNIL','LDTRUE','LDFALSE','LEN','CONCAT','NOP','HALT','VARG','NOT',
-            'CHKDBG','CHKTIM','CHKENV','ANTIHOOK','CHKEMU','CHKSBOX',
-            'REKEY','SMBC','TRAP'
+            'REKEY','SMBC'
         ];
         const allOpcodes = [];
         for (let i = 0; i < 256; i++) allOpcodes.push(i);
@@ -1566,97 +1543,83 @@ class VMArchitect {
         const shuffledOps = this.buildConfig.shuffleArray([...allOps]);
         for (let i = 0; i < shuffledOps.length; i++) {
             const op = shuffledOps[i];
-            const opcode = (shuffled[i] + this.activeConfig.opcodeOffset) & 0xFF;
-            this.opcodeMap[op] = { code: opcode };
-            this.reverseMap[opcode] = { op };
+            const opcode = (shuffled[i] + this.config.opcodeOffset) & 0xFF;
+            this.opcodeMap[op] = opcode;
+            this.reverseMap[opcode] = op;
         }
-        this.fakeOpcodes = [];
-        for (let i = shuffledOps.length; i < shuffledOps.length + 40; i++) {
-            const opcode = (shuffled[i % 256] + this.activeConfig.opcodeOffset) & 0xFF;
+        for (let i = shuffledOps.length; i < shuffledOps.length + 30; i++) {
+            const opcode = (shuffled[i % 256] + this.config.opcodeOffset) & 0xFF;
             if (!this.reverseMap[opcode]) {
-                this.reverseMap[opcode] = { op: 'TRAP' };
+                this.reverseMap[opcode] = 'TRAP';
                 this.fakeOpcodes.push(opcode);
             }
         }
     }
 
-    getOpcode(op) { return this.opcodeMap[op]?.code ?? 0; }
-
-    getSemanticConfig() {
-        const c = this.activeConfig;
-        return {
-            immediateKey: c.immediateKey, jumpKey: c.jumpKey, jumpRelative: c.jumpRelative,
-            invertConditionals: c.invertConditionals, popOrderSwap: c.popOrderSwap,
-            addTransform: c.addTransform, subTransform: c.subTransform, mulTransform: c.mulTransform,
-            addMask: c.addMask, xorSeed: c.xorSeed, stackDirection: c.stackDirection,
-            callConvention: c.callConvention, wordSize: c.wordSize, endianness: c.endianness,
-            rekeyInterval: c.rekeyInterval, selfModifyRate: c.selfModifyRate,
-            oneshotOpcodes: c.oneshotOpcodes, smXorMask: c.smXorMask
-        };
-    }
+    getOpcode(op) { return this.opcodeMap[op] ?? 0; }
 }
 
 class ControlFlowObfuscator {
-    constructor(buildConfig) { this.buildConfig = buildConfig; this.blockCounter = 0; }
+    constructor(buildConfig) { this.buildConfig = buildConfig; }
 
-    generateOpaquePredicateRuntime(count) {
+    generateOpaquePredicates(count) {
         const preds = [];
         for (let i = 0; i < count; i++) {
-            const a = this.buildConfig.seededRandomInt(2, 200);
-            const b = this.buildConfig.seededRandomInt(2, 200);
-            const c = a + b;
-            const kind = this.buildConfig.seededRandomInt(0, 6);
+            const kind = this.buildConfig.seededRandomInt(0, 5);
+            const v = this.buildConfig.generateId(3);
             let expr;
             switch (kind) {
-                case 0: expr = `((${a}*${a}+${b}*${b})%${c}==${(a*a+b*b)%c})`; break;
-                case 1: expr = `(${a}*${b}%2==${(a*b)%2})`; break;
-                case 2: expr = `(bit_and(${a},1)==${a&1})`; break;
-                case 3: expr = `(${a}+${b}>${Math.min(a,b)})`; break;
-                case 4: { const v = this.buildConfig.generateId(3); expr = `(function() local ${v}={} for ${v}k=1,${this.buildConfig.seededRandomInt(3,7)} do ${v}[${v}k]=${v}k end return #${v}>${0} end)()`; break; }
-                case 5: { const x = this.buildConfig.seededRandomInt(10, 99); expr = `(tostring(${x}):len()==${x.toString().length})`; break; }
-                case 6: { const x = this.buildConfig.seededRandomInt(1, 50); expr = `(type(${x})=="number")`; break; }
+                case 0: {
+                    const n = this.buildConfig.seededRandomInt(2, 50);
+                    expr = `(${n}*${n}%4~=2)`;
+                    break;
+                }
+                case 1: {
+                    const a = this.buildConfig.seededRandomInt(1, 99);
+                    const b = this.buildConfig.seededRandomInt(1, 99);
+                    expr = `((${a}+${b})*(${a}+${b})>=${a}*${a}+${b}*${b})`;
+                    break;
+                }
+                case 2: {
+                    const n = this.buildConfig.seededRandomInt(3, 97);
+                    expr = `(bit_and(bit_or(${n},bit_not(${n})),0xFFFFFFFF)~=0)`;
+                    break;
+                }
+                case 3: {
+                    const a = this.buildConfig.seededRandomInt(2, 30);
+                    expr = `(${a}*${a}*${a}%6==0 or ${a}*${a}*${a}%6~=0)`;
+                    break;
+                }
+                case 4: {
+                    const x = this.buildConfig.seededRandomInt(1, 255);
+                    expr = `(bit_xor(bit_xor(${x},${x}),0)==0)`;
+                    break;
+                }
+                case 5: {
+                    const a = this.buildConfig.seededRandomInt(10, 200);
+                    const b = this.buildConfig.seededRandomInt(10, 200);
+                    expr = `(bit_and(${a},${b})==bit_and(${b},${a}))`;
+                    break;
+                }
             }
-            preds.push({ expr, result: true, id: `_op${this.buildConfig.generateId(3)}` });
+            preds.push({ expr, id: `${v}`, result: true });
         }
         return preds;
     }
 
-    generateOpaquePredicateLua(preds) { return preds.map(p => `local ${p.id}=${p.expr}`).join('\n'); }
-
-    generateOpaqueGuard(preds) {
-        if (preds.length === 0) return 'true';
-        const count = Math.min(3, preds.length);
-        const indices = this.buildConfig.shuffleArray([...Array(preds.length).keys()]).slice(0, count);
-        return indices.map(i => preds[i].result ? preds[i].id : `not ${preds[i].id}`).join(' and ');
-    }
-
-    generateDeadHandlerCode(buildConfig) {
+    generateDeadCode(buildConfig) {
+        const v = buildConfig.generateId(2);
         const patterns = [];
-        const count = buildConfig.seededRandomInt(2, 6);
+        const count = buildConfig.seededRandomInt(1, 3);
         for (let i = 0; i < count; i++) {
-            const k = buildConfig.seededRandomInt(0, 4);
-            const v = buildConfig.generateId(3);
+            const k = buildConfig.seededRandomInt(0, 2);
             switch (k) {
-                case 0: patterns.push(`local ${v}=nil`); break;
-                case 1: patterns.push(`local ${v}=${buildConfig.seededRandomInt(0,999)}`); break;
-                case 2: patterns.push(`local ${v}=true if not ${v} then error() end`); break;
-                case 3: patterns.push(`local ${v}={} ${v}[1]=${buildConfig.seededRandomInt(0,999)} ${v}=nil`); break;
-                case 4: patterns.push(`local ${v}=tostring(${buildConfig.seededRandomInt(0,9999)})`); break;
+                case 0: patterns.push(`local ${v}${i}=${buildConfig.seededRandomInt(0,999)}`); break;
+                case 1: patterns.push(`local ${v}${i}=nil`); break;
+                case 2: patterns.push(`local ${v}${i}=true`); break;
             }
         }
         return patterns.join(' ');
-    }
-
-    generateFakeHandler(buildConfig) {
-        const v = buildConfig.generateId(4);
-        const kind = buildConfig.seededRandomInt(0, 3);
-        switch (kind) {
-            case 0: return `return function(s) local ${v}=s:pop() s:push(${v}) s:push(nil) s:pop() end`;
-            case 1: return `return function(s) local ${v}=${buildConfig.seededRandomInt(0,255)} s:push(${v}) s:pop() end`;
-            case 2: return `return function(s) local ${v}=s._stk local ${v}2=#${v} end`;
-            case 3: return `return function(s) local ${v}=s._pc s._pc=s._pc end`;
-        }
-        return `return function(s) end`;
     }
 }
 
@@ -1677,7 +1640,7 @@ class VMObfuscator {
 
     generateBitLib() {
         if (this.features.bitLib === 'native') {
-            return `local bit_and=function(a,b) return a & b end\nlocal bit_or=function(a,b) return a | b end\nlocal bit_xor=function(a,b) return a ~ b end\nlocal bit_not=function(a) return ~a end\nlocal bit_lshift=function(a,b) return a << b end\nlocal bit_rshift=function(a,b) return a >> b end`;
+            return `local bit_and=function(a,b)return a&b end local bit_or=function(a,b)return a|b end local bit_xor=function(a,b)return a~b end local bit_not=function(a)return~a end local bit_lshift=function(a,b)return a<<b end local bit_rshift=function(a,b)return a>>b end`;
         } else if (this.features.bitLib === 'bit32') {
             return `local bit_and=bit32.band local bit_or=bit32.bor local bit_xor=bit32.bxor local bit_not=bit32.bnot local bit_lshift=bit32.lshift local bit_rshift=bit32.rshift`;
         }
@@ -1707,62 +1670,23 @@ class VMObfuscator {
         });
     }
 
-    generateDecryptionRuntime(method) {
-        const chacha20Lua = `local function _rotl(x,n) x=bit_and(x,0xFFFFFFFF) return bit_or(bit_lshift(x,n),bit_rshift(x,32-n)) end
-local function _qr(s,a,b,c,d) s[a]=bit_and(s[a]+s[b],0xFFFFFFFF) s[d]=_rotl(bit_xor(s[d],s[a]),16) s[c]=bit_and(s[c]+s[d],0xFFFFFFFF) s[b]=_rotl(bit_xor(s[b],s[c]),12) s[a]=bit_and(s[a]+s[b],0xFFFFFFFF) s[d]=_rotl(bit_xor(s[d],s[a]),8) s[c]=bit_and(s[c]+s[d],0xFFFFFFFF) s[b]=_rotl(bit_xor(s[b],s[c]),7) end
-local function _cc20(kw,nw,ctr) local s={0x61707865,0x3320646e,0x79622d32,0x6b206574,kw[1],kw[2],kw[3],kw[4],kw[5],kw[6],kw[7],kw[8],ctr,nw[1],nw[2],nw[3]} local w={} for i=1,16 do w[i]=s[i] end for _=1,10 do _qr(w,1,5,9,13) _qr(w,2,6,10,14) _qr(w,3,7,11,15) _qr(w,4,8,12,16) _qr(w,1,6,11,16) _qr(w,2,7,12,13) _qr(w,3,8,9,14) _qr(w,4,5,10,15) end local b={} for i=1,16 do local v=bit_and(w[i]+s[i],0xFFFFFFFF) b[#b+1]=bit_and(v,0xFF) b[#b+1]=bit_and(bit_rshift(v,8),0xFF) b[#b+1]=bit_and(bit_rshift(v,16),0xFF) b[#b+1]=bit_and(bit_rshift(v,24),0xFF) end return b end
-local function _b2w(b) local w={} for i=1,math.floor(#b/4) do w[i]=bit_or(bit_or(bit_or(b[(i-1)*4+1] or 0,bit_lshift(b[(i-1)*4+2] or 0,8)),bit_lshift(b[(i-1)*4+3] or 0,16)),bit_lshift(b[(i-1)*4+4] or 0,24)) end return w end
-local function _dec(d,k,n) local kw=_b2w(k) local nw=_b2w(n) local r={} local blk for i=1,#d do local bi=(i-1)%64 if bi==0 then blk=_cc20(kw,nw,math.floor((i-1)/64)) end r[i]=bit_xor(d[i],blk[bi+1]) end return r end`;
-        if (method === 'xsalsa20poly1305') {
-            return `local _sodium_ok,_sodium_lib=pcall(function() return require("sodium") end)\nlocal _sodium_rt=_sodium_ok and _sodium_lib or nil\nlocal function _dec_sodium(d,k,n) if _sodium_rt and _sodium_rt.crypto_secretbox_open_easy then return {_sodium_rt.crypto_secretbox_open_easy(string.char(unpack(d)),string.char(unpack(n)),string.char(unpack(k))):byte(1,-1)} end error("sodium required") end\n${chacha20Lua}`;
-        }
-        return chacha20Lua;
-    }
-
-    generateHandlerDecryptor() {
-        const dkv = this.integritySystem._derivedKeyVar;
-        return `local _HK0={} for i=1,#${dkv} do _HK0[i]=${dkv}[i] end\nlocal function _dh(e,ek) local r=_dec(e.d,_HK0,e.n) local s="" for i=1,#r do s=s..string.char(r[i]) end return load(s)() end`;
-    }
-
     getHandlerCode(op, rw, config) {
-        const sc = config;
-        const immKey = sc.immediateKey;
-        const jmpKey = sc.jumpKey;
-        const jmpRel = sc.jumpRelative;
-        const popSwap = sc.popOrderSwap;
+        const immKey = config.immediateKey;
+        const jmpKey = config.jumpKey;
+        const jmpRel = config.jumpRelative;
+        const popSwap = config.popOrderSwap;
 
         const readJump = jmpRel
-            ? `(function() local _off=${rw} _off=bit_xor(_off,${jmpKey}) return s._pc+_off end)()`
+            ? `(function()local _o=${rw} _o=bit_xor(_o,${jmpKey})return s._pc+_o end)()`
             : `bit_xor(${rw},${jmpKey})`;
 
         const readImm = `bit_xor(${rw},${immKey})`;
-
         const binPop = popSwap ? `local a,b=s:pop(),s:pop()` : `local b,a=s:pop(),s:pop()`;
 
         const handlers = {
-            'ADD': (() => {
-                switch (sc.addTransform) {
-                    case 0: return `${binPop} s:push(a+b)`;
-                    case 1: return `${binPop} s:push(bit_xor(bit_xor(a,${sc.xorSeed})+bit_xor(b,${sc.xorSeed}),${sc.xorSeed}))`;
-                    case 2: return `${binPop} local _r=a+b s:push(_r)`;
-                    default: return `${binPop} s:push(a+b)`;
-                }
-            })(),
-            'SUB': (() => {
-                switch (sc.subTransform) {
-                    case 0: return `${binPop} s:push(a-b)`;
-                    case 1: return `${binPop} s:push(a+(-b))`;
-                    case 2: return `${binPop} local _r=a-b s:push(_r)`;
-                    default: return `${binPop} s:push(a-b)`;
-                }
-            })(),
-            'MUL': (() => {
-                switch (sc.mulTransform) {
-                    case 0: return `${binPop} s:push(a*b)`;
-                    case 1: return `${binPop} local _r=a*b s:push(_r)`;
-                    default: return `${binPop} s:push(a*b)`;
-                }
-            })(),
+            'ADD': `${binPop} s:push(a+b)`,
+            'SUB': `${binPop} s:push(a-b)`,
+            'MUL': `${binPop} s:push(a*b)`,
             'DIV': `${binPop} s:push(a/b)`,
             'MOD': `${binPop} s:push(a%b)`,
             'POW': `${binPop} s:push(a^b)`,
@@ -1772,37 +1696,32 @@ local function _dec(d,k,n) local kw=_b2w(k) local nw=_b2w(n) local r={} local bl
             'DUP': `s:push(s:peek())`,
             'SWAP': `local b,a=s:pop(),s:pop() s:push(b) s:push(a)`,
             'ROT3': `local c,b,a=s:pop(),s:pop(),s:pop() s:push(b) s:push(c) s:push(a)`,
-            'PICK': `local n=s:r8() s:push(s._stk[#s._stk-n])`,
-            'DROP': `local n=s:r8() for i=1,n do s:pop() end`,
             'JMP': `s._pc=${readJump}`,
             'JT': `local _t=${readJump} if s:pop() then s._pc=_t end`,
             'JF': `local _t=${readJump} if not s:pop() then s._pc=_t end`,
             'JNIL': `local _t=${readJump} if s:peek()==nil then s._pc=_t end`,
-            'LOOP': `local st,lim,v=s:pop(),s:pop(),s:pop() s:push((st>0 and v<=lim) or (st<0 and v>=lim) or (st==0))`,
-            'TFOR': `local _n=s:r8() local _ii=s:r8() local _si=s:r8() local _ci=s:r8() local _iter=s._L[_ii] and s._L[_ii].v or nil local _state=s._L[_si] and s._L[_si].v or nil local _ctl=s._L[_ci] and s._L[_ci].v or nil local _res={_iter(_state,_ctl)} for _i=1,_n do if not s._L[_ci+_i] then s._L[_ci+_i]={v=nil} end s._L[_ci+_i].v=_res[_i] end if s._L[_ci] then s._L[_ci].v=_res[1] end`,
-            'INITLOC': `local _i=s:r8() if not s._L[_i] then s._L[_i]={v=nil} end`,
-            'LDLOC': `local _i=s:r8() local _c=s._L[_i] s:push(_c and _c.v or nil)`,
-            'STLOC': `local _i=s:r8() if not s._L[_i] then s._L[_i]={v=nil} end s._L[_i].v=s:pop()`,
+            'LOOP': `local st,lim,v=s:pop(),s:pop(),s:pop() s:push((st>0 and v<=lim)or(st<0 and v>=lim)or(st==0))`,
+            'TFOR': `local _n=s:r8()local _ii=s:r8()local _si=s:r8()local _ci=s:r8()local _iter=s._L[_ii]and s._L[_ii].v or nil local _state=s._L[_si]and s._L[_si].v or nil local _ctl=s._L[_ci]and s._L[_ci].v or nil local _res={_iter(_state,_ctl)}for _i=1,_n do if not s._L[_ci+_i]then s._L[_ci+_i]={v=nil}end s._L[_ci+_i].v=_res[_i]end if s._L[_ci]then s._L[_ci].v=_res[1]end`,
+            'INITLOC': `local _i=s:r8()if not s._L[_i]then s._L[_i]={v=nil}end`,
+            'LDLOC': `local _i=s:r8()local _c=s._L[_i]s:push(_c and _c.v or nil)`,
+            'STLOC': `local _i=s:r8()if not s._L[_i]then s._L[_i]={v=nil}end s._L[_i].v=s:pop()`,
             'LDGLOB': `s:push(s._G[s._K[${readImm}]])`,
             'STGLOB': `s._G[s._K[${readImm}]]=s:pop()`,
-            'LDUP': `local _i=s:r8() local _c=s._U and s._U[_i] s:push(_c and _c.v or nil)`,
-            'STUP': `local _i=s:r8() if s._U and s._U[_i] then s._U[_i].v=s:pop() else s:pop() end`,
+            'LDUP': `local _i=s:r8()local _c=s._U and s._U[_i]s:push(_c and _c.v or nil)`,
+            'STUP': `local _i=s:r8()if s._U and s._U[_i]then s._U[_i].v=s:pop()else s:pop()end`,
             'NEWTBL': `s:push({})`,
-            'GETTBL': `local k,t=s:pop(),s:pop() s:push(t[k])`,
-            'SETTBL': `local v,k,t=s:pop(),s:pop(),s:pop() t[k]=v`,
+            'GETTBL': `local k,t=s:pop(),s:pop()s:push(t[k])`,
+            'SETTBL': `local v,k,t=s:pop(),s:pop(),s:pop()t[k]=v`,
             'CALL': (() => {
-                if (sc.callConvention === 'reversed') {
-                    return `local n=s:r8() local args={} for i=n,1,-1 do args[i]=s:pop() end local f=s:pop() local ok,res=true,nil ok,res=pcall(function() return {f(unpack(args,1,n))} end) if ok and res then for i=1,#res do s:push(res[i]) end s:push(#res) else s:push(nil) s:push(1) end`;
+                if (config.callConvention === 'reversed') {
+                    return `local n=s:r8()local args={}for i=n,1,-1 do args[i]=s:pop()end local f=s:pop()local ok,res=pcall(function()return{f(unpack(args,1,n))}end)if ok and res then for i=1,#res do s:push(res[i])end s:push(#res)else s:push(nil)s:push(1)end`;
                 }
-                return `local n=s:r8() local args={} for i=n,1,-1 do args[i]=s:pop() end local f=s:pop() local res={f(unpack(args,1,n))} for i=1,#res do s:push(res[i]) end s:push(#res)`;
+                return `local n=s:r8()local args={}for i=n,1,-1 do args[i]=s:pop()end local f=s:pop()local res={f(unpack(args,1,n))}for i=1,#res do s:push(res[i])end s:push(#res)`;
             })(),
-            'MRET': `local want=s:r8() local got=s:pop() or 0 if got<want then for _mi=1,want-got do s:push(nil) end elseif got>want then for _mi=1,got-want do local _t=s._stk[#s._stk-want] s._stk[#s._stk-want]=nil end end`,
-            'TCALL': `local n=s:r8() local args={} for i=n,1,-1 do args[i]=s:pop() end local f=s:pop() return f(unpack(args,1,n))`,
-            'RET': `local n=s:r8() local res={} for i=n,1,-1 do res[i]=s:pop() end s._run=false return unpack(res,1,n)`,
-            'CLOS': (() => {
-                return `local fi=${readImm} local fd=s._K[fi] local _pL=s._L s:push(function(...) local _nvm=s._vm.new(fd._bc,fd._bk,fd._bn,fd._k) _nvm._U={} for _ck,_cv in pairs(_pL) do _nvm._U[_ck]=_cv end local _a={...} local _ac=select("#",...) for _ai=1,fd._p do if not _nvm._L[_ai-1] then _nvm._L[_ai-1]={v=nil} end _nvm._L[_ai-1].v=_a[_ai] end if fd._va==1 then _nvm._va={} for _vi=fd._p+1,_ac do _nvm._va[_vi-fd._p]=_a[_vi] end end return _nvm:run() end)`;
-            })(),
-            'SELF': `local k,t=s:pop(),s:peek() s:push(t[k])`,
+            'MRET': `local want=s:r8()local got=s:pop()or 0 if got<want then for _mi=1,want-got do s:push(nil)end elseif got>want then for _mi=1,got-want do local _t=s._stk[#s._stk-want]s._stk[#s._stk-want]=nil end end`,
+            'RET': `local n=s:r8()local res={}for i=n,1,-1 do res[i]=s:pop()end s._run=false return unpack(res,1,n)`,
+            'CLOS': `local fi=${readImm} local fd=s._K[fi]local _pL=s._L s:push(function(...)local _nvm=s._vm.new(fd._bc,fd._bk,fd._bn,fd._k)_nvm._U={}for _ck,_cv in pairs(_pL)do _nvm._U[_ck]=_cv end local _a={...}local _ac=select("#",...)for _ai=1,fd._p do if not _nvm._L[_ai-1]then _nvm._L[_ai-1]={v=nil}end _nvm._L[_ai-1].v=_a[_ai]end if fd._va==1 then _nvm._va={}for _vi=fd._p+1,_ac do _nvm._va[_vi-fd._p]=_a[_vi]end end return _nvm:run()end)`,
+            'SELF': `local k,t=s:pop(),s:peek()s:push(t[k])`,
             'EQ': `${binPop} s:push(a==b)`,
             'NEQ': `${binPop} s:push(a~=b)`,
             'LT': `${binPop} s:push(a<b)`,
@@ -1823,120 +1742,79 @@ local function _dec(d,k,n) local kw=_b2w(k) local nw=_b2w(n) local r={} local bl
             'CONCAT': `${binPop} s:push(tostring(a)..tostring(b))`,
             'NOP': ``,
             'HALT': `s._run=false`,
-            'VARG': `if s._va then for _vi=1,#s._va do s:push(s._va[_vi]) end else s:push(nil) end`,
+            'VARG': `if s._va then for _vi=1,#s._va do s:push(s._va[_vi])end else s:push(nil)end`,
             'NOT': `s:push(not s:pop())`,
-            'CHKDBG': `if ${this.integritySystem._antiDebugVar} then s._run=false end`,
-            'CHKTIM': `if not ${this.integritySystem._tickFn}() then s._run=false end`,
-            'CHKENV': `if not ${this.integritySystem._envCheckFn}() then s._run=false end`,
-            'ANTIHOOK': `if not ${this.integritySystem._hookCheckFn}() then s._run=false end`,
-            'CHKEMU': `if ${this.integritySystem._emuVar} then s._run=false end`,
-            'CHKSBOX': `if ${this.integritySystem._sboxVar} or not ${this.integritySystem._timingVar} then s._run=false end`,
             'REKEY': `s._rkc=(s._rkc or 0)+1`,
-            'SMBC': `local _si=s:r8() local _sv=s:r8() local _sn=s:r8() for _sj=0,_sn-1 do if s._C[_si+_sj] then s._C[_si+_sj]=bit_xor(s._C[_si+_sj],_sv) end end`,
-            'TRAP': `s._run=false`
+            'SMBC': `local _si=s:r8()local _sv=s:r8()local _sn=s:r8()for _sj=0,_sn-1 do if s._C[_si+_sj]then s._C[_si+_sj]=bit_xor(s._C[_si+_sj],_sv)end end`
         };
         return handlers[op] || ``;
     }
 
-    generateEncryptedHandlers() {
-        const config = this.vmArch.activeConfig;
-        const sc = this.vmArch.getSemanticConfig();
-        const allOps = Object.keys(this.vmArch.opcodeMap);
+    buildDispatchTable(usedOps) {
+        const config = this.vmArch.config;
         const le = config.endianness === 'little';
         const rw = le ? `s:r8()+s:r8()*256+s:r8()*65536+s:r8()*16777216` : `s:r8()*16777216+s:r8()*65536+s:r8()*256+s:r8()`;
 
-        const handlerCode = {};
-        for (const op of allOps) {
-            const opcode = this.vmArch.opcodeMap[op].code;
-            const code = this.getHandlerCode(op, rw, sc);
-            const deadCode = this.cfObfuscator.generateDeadHandlerCode(this.buildConfig);
-            const wrapCode = this.buildConfig.seededRandom() > 0.6 ? `${deadCode} ${code}` : code;
-            handlerCode[opcode] = wrapCode;
+        const entries = [];
+        const deadGen = this.cfObfuscator;
+
+        for (const op of usedOps) {
+            const opcode = this.vmArch.opcodeMap[op];
+            if (opcode === undefined) continue;
+            const code = this.getHandlerCode(op, rw, config);
+            if (!code) continue;
+            const dead = this.buildConfig.seededRandom() > 0.6 ? deadGen.generateDeadCode(this.buildConfig) + ' ' : '';
+            entries.push(`[${opcode}]=function(s)${dead}${code} end`);
         }
 
-        const encryptedHandlers = {};
-        for (const [opcode, code] of Object.entries(handlerCode)) {
-            const funcStr = `return function(s) ${code} end`;
-            const encrypted = this.cryptoSystem.encryptHandlers(funcStr, this.handlerKeyBytes, parseInt(opcode));
-            encryptedHandlers[opcode] = encrypted;
+        const fakeCount = this.buildConfig.seededRandomInt(3, 8);
+        for (let i = 0; i < fakeCount && i < this.vmArch.fakeOpcodes.length; i++) {
+            const fop = this.vmArch.fakeOpcodes[i];
+            entries.push(`[${fop}]=function(s)s._run=false end`);
         }
 
-        for (const fakeOp of this.vmArch.fakeOpcodes.slice(0, this.buildConfig.seededRandomInt(5, 15))) {
-            const fakeCode = this.cfObfuscator.generateFakeHandler(this.buildConfig);
-            const encrypted = this.cryptoSystem.encryptHandlers(fakeCode, this.handlerKeyBytes, fakeOp);
-            encryptedHandlers[fakeOp] = encrypted;
-        }
-
-        return encryptedHandlers;
+        return `return{${entries.join(',')}}`;
     }
 
-    generateRekeyRuntime(config) {
-        const interval = config.rekeyInterval;
-        const v = this.buildConfig.generateId(4);
-        return `local ${v}_rkc=0
-local ${v}_rki=${interval}
-local function ${v}_rk(hc)
-${v}_rkc=${v}_rkc+1
-if ${v}_rkc%${v}_rki==0 then
-for op,_ in pairs(hc) do hc[op]=nil end
-end
-end`;
-    }
-
-    applySelfModifyPass(bytecodeArray, buildConfig, vmArch) {
-        const mask = vmArch.activeConfig.smXorMask;
-        const smOp = vmArch.getOpcode('SMBC');
-        const nopOp = vmArch.getOpcode('NOP');
+    applySelfModifyPass(bytecodeArray) {
+        const keys = this.vmArch.config.smXorKeys;
+        const smOp = this.vmArch.getOpcode('SMBC');
         const regions = [];
-        const regionCount = buildConfig.seededRandomInt(3, 8);
+        const regionCount = this.buildConfig.seededRandomInt(2, 5);
         for (let r = 0; r < regionCount; r++) {
-            const start = buildConfig.seededRandomInt(10, Math.max(11, bytecodeArray.length - 20));
-            const len = buildConfig.seededRandomInt(2, 6);
+            if (bytecodeArray.length < 25) break;
+            const start = this.buildConfig.seededRandomInt(10, Math.max(11, bytecodeArray.length - 15));
+            const len = this.buildConfig.seededRandomInt(2, 5);
             if (start + len >= bytecodeArray.length) continue;
             let safe = true;
             for (const existing of regions) {
                 if (Math.abs(start - existing.start) < existing.len + 6) { safe = false; break; }
             }
             if (!safe) continue;
-            regions.push({ start, len });
+            const keyIdx = r % keys.length;
+            regions.push({ start, len, mask: keys[keyIdx] });
         }
-        const patches = [];
         for (const region of regions) {
             for (let i = 0; i < region.len; i++) {
                 if (region.start + i < bytecodeArray.length) {
-                    bytecodeArray[region.start + i] = (bytecodeArray[region.start + i] ^ mask) & 0xFF;
+                    bytecodeArray[region.start + i] = (bytecodeArray[region.start + i] ^ region.mask) & 0xFF;
                 }
             }
-            patches.push({ insertBefore: region.start, targetPos: region.start + 4, mask, len: region.len });
         }
-        patches.sort((a, b) => b.insertBefore - a.insertBefore);
-        for (const patch of patches) {
-            const smBytes = [smOp, (patch.targetPos) & 0xFF, mask & 0xFF, patch.len & 0xFF];
-            bytecodeArray.splice(patch.insertBefore, 0, ...smBytes);
-            for (const otherPatch of patches) {
-                if (otherPatch !== patch && otherPatch.insertBefore >= patch.insertBefore) {
-                    otherPatch.targetPos += 4;
+        regions.sort((a, b) => b.start - a.start);
+        for (const region of regions) {
+            const smBytes = [smOp, (region.start + 4) & 0xFF, region.mask & 0xFF, region.len & 0xFF];
+            bytecodeArray.splice(region.start, 0, ...smBytes);
+            for (const other of regions) {
+                if (other !== region && other.start >= region.start) {
+                    other.start += 4;
                 }
             }
         }
         return bytecodeArray;
     }
 
-    generateOneShotRuntime(config) {
-        const v = this.buildConfig.generateId(4);
-        const integrityOps = ['CHKDBG', 'CHKENV', 'ANTIHOOK', 'CHKEMU', 'CHKSBOX'].map(op => this.vmArch.opcodeMap[op]?.code).filter(c => c !== undefined);
-        const oneshotOps = integrityOps.slice(0, this.buildConfig.seededRandomInt(2, integrityOps.length));
-        return `local ${v}_os={${oneshotOps.map(o => `[${o}]=true`).join(',')}}
-local ${v}_oe={}
-local function ${v}_osc(op,hc)
-if ${v}_os[op] and ${v}_oe[op] then hc[op]=nil return true end
-if ${v}_os[op] then ${v}_oe[op]=true end
-return false
-end`;
-    }
-
     serializeConstants(encConstants) {
-        const self = this;
         function serializeOne(c) {
             if (c.t === 's') return `{t="s",d={${c.d.join(',')}},k={${c.k.join(',')}},n={${c.n.join(',')}}}`;
             if (c.t === 'i') return `{t="i",d={${c.d.join(',')}},k={${c.k.join(',')}},n={${c.n.join(',')}}}`;
@@ -1952,108 +1830,80 @@ end`;
 
     generateRuntime(compiled) {
         let bcBytes = [...compiled.bytecode];
-        bcBytes = this.applySelfModifyPass(bcBytes, this.buildConfig, this.vmArch);
+        bcBytes = this.applySelfModifyPass(bcBytes);
         const encBytecode = this.encryptBytecode(bcBytes);
         const encConstants = this.encryptConstants(compiled.constants);
         const checksum = this.integritySystem.computeChecksum(bcBytes);
-        const vmName = this.genVar('VM');
-        const bcVar = this.genVar('bc');
-        const ksVar = this.genVar('ks');
-        const encHandlers = this.generateEncryptedHandlers();
-        const config = this.vmArch.activeConfig;
-        const maskedKeyBytes = this.integritySystem.maskHandlerKey(this.handlerKeyBytes);
-        const bcKeyStr = `{${encBytecode.key.join(',')}}`;
+        const derivedKey = this.integritySystem.deriveHandlerKey(bcBytes, this.handlerKeyBytes);
+        const keyShares = this.integritySystem.splitKey(Array.from(encBytecode.key));
+
+        const vmName = this.genVar('V');
+        const bcVar = this.genVar('b');
+        const ksVar = this.genVar('k');
+
+        const dispatchStr = this.buildDispatchTable(compiled.usedOps);
+        const encDispatch = this.cryptoSystem.encryptBlob(dispatchStr);
+
+        const config = this.vmArch.config;
         const bcNonceStr = `{${encBytecode.nonce.join(',')}}`;
         const serializedConstants = this.serializeConstants(encConstants);
-        const encHandlersSerialized = Object.entries(encHandlers).map(([op, enc]) => `[${op}]={d={${enc.data.join(',')}},n={${enc.nonce.join(',')}}}`).join(',');
-        const opaquePredicates = this.cfObfuscator.generateOpaquePredicateRuntime(5);
-        const opaqueGuard = this.cfObfuscator.generateOpaqueGuard(opaquePredicates);
-        const opaqueLua = this.cfObfuscator.generateOpaquePredicateLua(opaquePredicates);
-        const rekeyRuntime = this.generateRekeyRuntime(config);
-        const oneShotRuntime = this.generateOneShotRuntime(config);
-        const rekeyFn = rekeyRuntime.match(/local function (\S+)\(/)[1];
-        const osFn = oneShotRuntime.match(/local function (\S+)\(/)[1];
+
+        const preds = this.cfObfuscator.generateOpaquePredicates(3);
+        const predDecls = preds.map(p => `local ${p.id}=${p.expr}`).join('\n');
+        const predGuard = preds.map(p => p.id).join(' and ');
+
+        const sv = [this.genVar('s'), this.genVar('s'), this.genVar('s'), this.genVar('s')];
+        const shareDecls = keyShares.map((s, i) => `local ${sv[i]}={${s.join(',')}}`).join('\n');
+        const keyRecon = this.genVar('rk');
+
+        const antiDbg = this.genVar('ad');
+        const envChk = this.genVar('ec');
+        const rekeyFn = this.genVar('rk');
+        const rekeyInterval = config.rekeyInterval;
 
         return `do
 ${this.generateBitLib()}
 ${this.generateTableUnpack()}
-${this.integritySystem.generateAntiDebug()}
-${this.integritySystem.generateEnvCheck()}
-${this.integritySystem.generateHookDetection()}
-${this.integritySystem.generateAntiEmulation()}
-${this.integritySystem.generateSandboxDetection()}
-${this.integritySystem.generateTimingCheck()}
-${this.generateDecryptionRuntime(encBytecode.method)}
-${this.integritySystem.generateIntegrityKeyDerivation(maskedKeyBytes)}
-${this.generateHandlerDecryptor()}
-${opaqueLua}
-${rekeyRuntime}
-${oneShotRuntime}
-local function _ds(d,k,n) local r=_dec(d,type(k)=="table" and k or {k},type(n)=="table" and n or {}) local rl=r[1]+(r[2] or 0)*256+(r[3] or 0)*65536+(r[4] or 0)*16777216 local s="" for i=5,4+rl do s=s..string.char(r[i] or 0) end return s end
-local function _di(d,k,n) local r=_dec(d,type(k)=="table" and k or {k},type(n)=="table" and n or {}) return r[1]+(r[2] or 0)*256+(r[3] or 0)*65536+(r[4] or 0)*16777216 end
-local function _dk(ks)
-local r={}
-for i,c in ipairs(ks) do
-if c.t=="s" then r[i]=_ds(c.d,c.k,c.n)
-elseif c.t=="i" then r[i]=_di(c.d,c.k,c.n)
-elseif c.t=="n" then r[i]=c.v
-elseif c.t=="f" then r[i]={_t="f",_bc=c.bc,_bk=c.bk,_bn=c.bn,_k=_dk(c.k),_p=c.p,_va=c.va}
-else r[i]=c.v end
-end
-return r
-end
-local function _dbc(bc,k,n) return _dec(bc,type(k)=="table" and k or {k},type(n)=="table" and n or {}) end
-local _EH={${encHandlersSerialized}}
-local _HC={}
+local ${antiDbg}=false
+do local _ok,_=pcall(function()if debug and debug.getinfo then local i=debug.getinfo(1)if i and i.what=="C"then ${antiDbg}=true end end if debug and debug.gethook then local h=debug.gethook and debug.gethook()if h then ${antiDbg}=true end end end)end
+local ${envChk}=true
+do local _ef={"print","pairs","ipairs","next","type","tostring","tonumber","select","rawget","rawset","getmetatable","setmetatable","pcall","xpcall","error","assert"}local _es={}for _,k in ipairs(_ef)do if _G[k]then _es[k]=tostring(_G[k])end end ${envChk}=function()for k,v in pairs(_es)do if not _G[k]or tostring(_G[k])~=v then return false end end return true end end
+local function _rotl(x,n)x=bit_and(x,0xFFFFFFFF)return bit_or(bit_lshift(x,n),bit_rshift(x,32-n))end
+local function _qr(s,a,b,c,d)s[a]=bit_and(s[a]+s[b],0xFFFFFFFF)s[d]=_rotl(bit_xor(s[d],s[a]),16)s[c]=bit_and(s[c]+s[d],0xFFFFFFFF)s[b]=_rotl(bit_xor(s[b],s[c]),12)s[a]=bit_and(s[a]+s[b],0xFFFFFFFF)s[d]=_rotl(bit_xor(s[d],s[a]),8)s[c]=bit_and(s[c]+s[d],0xFFFFFFFF)s[b]=_rotl(bit_xor(s[b],s[c]),7)end
+local function _cc20(kw,nw,ctr)local s={0x61707865,0x3320646e,0x79622d32,0x6b206574,kw[1],kw[2],kw[3],kw[4],kw[5],kw[6],kw[7],kw[8],ctr,nw[1],nw[2],nw[3]}local w={}for i=1,16 do w[i]=s[i]end for _=1,10 do _qr(w,1,5,9,13)_qr(w,2,6,10,14)_qr(w,3,7,11,15)_qr(w,4,8,12,16)_qr(w,1,6,11,16)_qr(w,2,7,12,13)_qr(w,3,8,9,14)_qr(w,4,5,10,15)end local b={}for i=1,16 do local v=bit_and(w[i]+s[i],0xFFFFFFFF)b[#b+1]=bit_and(v,0xFF)b[#b+1]=bit_and(bit_rshift(v,8),0xFF)b[#b+1]=bit_and(bit_rshift(v,16),0xFF)b[#b+1]=bit_and(bit_rshift(v,24),0xFF)end return b end
+local function _b2w(b)local w={}for i=1,math.floor(#b/4)do w[i]=bit_or(bit_or(bit_or(b[(i-1)*4+1]or 0,bit_lshift(b[(i-1)*4+2]or 0,8)),bit_lshift(b[(i-1)*4+3]or 0,16)),bit_lshift(b[(i-1)*4+4]or 0,24))end return w end
+local function _dec(d,k,n)local kw=_b2w(k)local nw=_b2w(n)local r={}local blk for i=1,#d do local bi=(i-1)%64 if bi==0 then blk=_cc20(kw,nw,math.floor((i-1)/64))end r[i]=bit_xor(d[i],blk[bi+1])end return r end
+${shareDecls}
+local ${keyRecon}={}for i=1,#${sv[0]} do ${keyRecon}[i]=bit_xor(bit_xor(bit_xor(${sv[0]}[i],${sv[1]}[i]),${sv[2]}[i]),${sv[3]}[i])end
+${predDecls}
+local _ED={${encDispatch.data.join(',')}}
+local _EK={${encDispatch.key.join(',')}}
+local _EN={${encDispatch.nonce.join(',')}}
+local _DR=_dec(_ED,_EK,_EN)
+local _DS=""for i=1,#_DR do _DS=_DS..string.char(_DR[i])end
+local _HT=load(_DS)()
+local function _ds(d,k,n)local r=_dec(d,type(k)=="table"and k or{k},type(n)=="table"and n or{})local rl=r[1]+(r[2]or 0)*256+(r[3]or 0)*65536+(r[4]or 0)*16777216 local s=""for i=5,4+rl do s=s..string.char(r[i]or 0)end return s end
+local function _di(d,k,n)local r=_dec(d,type(k)=="table"and k or{k},type(n)=="table"and n or{})return r[1]+(r[2]or 0)*256+(r[3]or 0)*65536+(r[4]or 0)*16777216 end
+local function _dk(ks)local r={}for i,c in ipairs(ks)do if c.t=="s"then r[i]=_ds(c.d,c.k,c.n)elseif c.t=="i"then r[i]=_di(c.d,c.k,c.n)elseif c.t=="n"then r[i]=c.v elseif c.t=="f"then r[i]={_t="f",_bc=c.bc,_bk=c.bk,_bn=c.bn,_k=_dk(c.k),_p=c.p,_va=c.va}else r[i]=c.v end end return r end
+local function _dbc(bc,k,n)return _dec(bc,type(k)=="table"and k or{k},type(n)=="table"and n or{})end
 local ${vmName}={}
 ${vmName}.__index=${vmName}
-function ${vmName}.new(bc,bk,bn,ks)
-local s=setmetatable({},${vmName})
-s._C=_dbc(bc,bk,bn)
-s._K=_dk(ks)
-s._stk={}
-s._L={}
-s._U=nil
-s._va=nil
-s._G=_G
-s._pc=1
-s._run=true
-s._vm=${vmName}
-s._rkc=0
-return s
-end
-function ${vmName}:push(v) self._stk[#self._stk+1]=v end
-function ${vmName}:pop() local v=self._stk[#self._stk] self._stk[#self._stk]=nil return v end
-function ${vmName}:peek() return self._stk[#self._stk] end
-function ${vmName}:r8() local b=self._C[self._pc] or 0 self._pc=self._pc+1 return b end
-local function _gh(op)
-if not _HC[op] then
-local e=_EH[op]
-if e then
-local ok,h=pcall(_dh,e,_HK0)
-if ok and h then _HC[op]=h end
-end
-end
-return _HC[op]
-end
+function ${vmName}.new(bc,bk,bn,ks)local s=setmetatable({},${vmName})s._C=_dbc(bc,bk,bn)s._K=_dk(ks)s._stk={}s._L={}s._U=nil s._va=nil s._G=_G s._pc=1 s._run=true s._vm=${vmName} s._rkc=0 return s end
+function ${vmName}:push(v)self._stk[#self._stk+1]=v end
+function ${vmName}:pop()local v=self._stk[#self._stk]self._stk[#self._stk]=nil return v end
+function ${vmName}:peek()return self._stk[#self._stk]end
+function ${vmName}:r8()local b=self._C[self._pc]or 0 self._pc=self._pc+1 return b end
 function ${vmName}:run()
 local _sc=0
 while self._run and self._pc<=#self._C do
 local op=self:r8()
 _sc=_sc+1
-if ${osFn}(op,_HC) then
+if _sc%${rekeyInterval}==0 then
+if ${antiDbg} or not ${envChk}()then self._run=false return end
 end
-if _sc%${config.rekeyInterval}==0 then
-${rekeyFn}(_HC)
-end
-local h=_gh(op)
-if h then
-local r=h(self)
-if r~=nil then return r end
-elseif _EH[op] then
-local ok2,h2=pcall(_dh,_EH[op],_HK0)
-if ok2 and h2 then _HC[op]=h2 local r=h2(self) if r~=nil then return r end end
-end
+local h=_HT[op]
+if h then local r=h(self)if r~=nil then return r end
+else self._run=false end
 end
 return self:pop()
 end
@@ -2061,33 +1911,33 @@ local ${bcVar}={${encBytecode.data.join(',')}}
 local ${ksVar}={${serializedConstants}}
 local _cs={${checksum.h1},${checksum.h2},${checksum.h3},${checksum.h4}}
 local function _vcs()
-local bc=_dbc(${bcVar},${bcKeyStr},${bcNonceStr})
+local bc=_dbc(${bcVar},${keyRecon},${bcNonceStr})
 local h1,h2,h3,h4=${this.integritySystem.seed},${this.integritySystem.seed}~0x6a09e667,${this.integritySystem.seed}~0xbb67ae85,${this.integritySystem.seed}~0x3c6ef372
 local len=#bc
 for i=1,len,16 do
-local k1=bit_or(bit_or(bit_or(bc[i] or 0,bit_lshift(bc[i+1] or 0,8)),bit_lshift(bc[i+2] or 0,16)),bit_lshift(bc[i+3] or 0,24))
-local k2=bit_or(bit_or(bit_or(bc[i+4] or 0,bit_lshift(bc[i+5] or 0,8)),bit_lshift(bc[i+6] or 0,16)),bit_lshift(bc[i+7] or 0,24))
-local k3=bit_or(bit_or(bit_or(bc[i+8] or 0,bit_lshift(bc[i+9] or 0,8)),bit_lshift(bc[i+10] or 0,16)),bit_lshift(bc[i+11] or 0,24))
-local k4=bit_or(bit_or(bit_or(bc[i+12] or 0,bit_lshift(bc[i+13] or 0,8)),bit_lshift(bc[i+14] or 0,16)),bit_lshift(bc[i+15] or 0,24))
-k1=bit_and(k1*0x239b961b,0xFFFFFFFF) k1=bit_or(bit_lshift(k1,15),bit_rshift(k1,17)) k1=bit_and(k1*0xab0e9789,0xFFFFFFFF) h1=bit_xor(h1,k1)
-h1=bit_or(bit_lshift(h1,19),bit_rshift(h1,13)) h1=bit_and(h1+h2,0xFFFFFFFF) h1=bit_and(h1*5+0x561ccd1b,0xFFFFFFFF)
-k2=bit_and(k2*0xab0e9789,0xFFFFFFFF) k2=bit_or(bit_lshift(k2,16),bit_rshift(k2,16)) k2=bit_and(k2*0x38b34ae5,0xFFFFFFFF) h2=bit_xor(h2,k2)
-h2=bit_or(bit_lshift(h2,17),bit_rshift(h2,15)) h2=bit_and(h2+h3,0xFFFFFFFF) h2=bit_and(h2*5+0x0bcaa747,0xFFFFFFFF)
-k3=bit_and(k3*0x38b34ae5,0xFFFFFFFF) k3=bit_or(bit_lshift(k3,17),bit_rshift(k3,15)) k3=bit_and(k3*0xa1e38b93,0xFFFFFFFF) h3=bit_xor(h3,k3)
-h3=bit_or(bit_lshift(h3,15),bit_rshift(h3,17)) h3=bit_and(h3+h4,0xFFFFFFFF) h3=bit_and(h3*5+0x96cd1c35,0xFFFFFFFF)
-k4=bit_and(k4*0xa1e38b93,0xFFFFFFFF) k4=bit_or(bit_lshift(k4,18),bit_rshift(k4,14)) k4=bit_and(k4*0x239b961b,0xFFFFFFFF) h4=bit_xor(h4,k4)
-h4=bit_or(bit_lshift(h4,13),bit_rshift(h4,19)) h4=bit_and(h4+h1,0xFFFFFFFF) h4=bit_and(h4*5+0x32ac3b17,0xFFFFFFFF)
+local k1=bit_or(bit_or(bit_or(bc[i]or 0,bit_lshift(bc[i+1]or 0,8)),bit_lshift(bc[i+2]or 0,16)),bit_lshift(bc[i+3]or 0,24))
+local k2=bit_or(bit_or(bit_or(bc[i+4]or 0,bit_lshift(bc[i+5]or 0,8)),bit_lshift(bc[i+6]or 0,16)),bit_lshift(bc[i+7]or 0,24))
+local k3=bit_or(bit_or(bit_or(bc[i+8]or 0,bit_lshift(bc[i+9]or 0,8)),bit_lshift(bc[i+10]or 0,16)),bit_lshift(bc[i+11]or 0,24))
+local k4=bit_or(bit_or(bit_or(bc[i+12]or 0,bit_lshift(bc[i+13]or 0,8)),bit_lshift(bc[i+14]or 0,16)),bit_lshift(bc[i+15]or 0,24))
+k1=bit_and(k1*0x239b961b,0xFFFFFFFF)k1=bit_or(bit_lshift(k1,15),bit_rshift(k1,17))k1=bit_and(k1*0xab0e9789,0xFFFFFFFF)h1=bit_xor(h1,k1)
+h1=bit_or(bit_lshift(h1,19),bit_rshift(h1,13))h1=bit_and(h1+h2,0xFFFFFFFF)h1=bit_and(h1*5+0x561ccd1b,0xFFFFFFFF)
+k2=bit_and(k2*0xab0e9789,0xFFFFFFFF)k2=bit_or(bit_lshift(k2,16),bit_rshift(k2,16))k2=bit_and(k2*0x38b34ae5,0xFFFFFFFF)h2=bit_xor(h2,k2)
+h2=bit_or(bit_lshift(h2,17),bit_rshift(h2,15))h2=bit_and(h2+h3,0xFFFFFFFF)h2=bit_and(h2*5+0x0bcaa747,0xFFFFFFFF)
+k3=bit_and(k3*0x38b34ae5,0xFFFFFFFF)k3=bit_or(bit_lshift(k3,17),bit_rshift(k3,15))k3=bit_and(k3*0xa1e38b93,0xFFFFFFFF)h3=bit_xor(h3,k3)
+h3=bit_or(bit_lshift(h3,15),bit_rshift(h3,17))h3=bit_and(h3+h4,0xFFFFFFFF)h3=bit_and(h3*5+0x96cd1c35,0xFFFFFFFF)
+k4=bit_and(k4*0xa1e38b93,0xFFFFFFFF)k4=bit_or(bit_lshift(k4,18),bit_rshift(k4,14))k4=bit_and(k4*0x239b961b,0xFFFFFFFF)h4=bit_xor(h4,k4)
+h4=bit_or(bit_lshift(h4,13),bit_rshift(h4,19))h4=bit_and(h4+h1,0xFFFFFFFF)h4=bit_and(h4*5+0x32ac3b17,0xFFFFFFFF)
 end
-h1=bit_xor(h1,len) h2=bit_xor(h2,len) h3=bit_xor(h3,len) h4=bit_xor(h4,len)
-h1=bit_and(h1+h2+h3+h4,0xFFFFFFFF) h2=bit_and(h2+h1,0xFFFFFFFF) h3=bit_and(h3+h1,0xFFFFFFFF) h4=bit_and(h4+h1,0xFFFFFFFF)
-h1=bit_xor(h1,bit_rshift(h1,16)) h1=bit_and(h1*0x85ebca6b,0xFFFFFFFF) h1=bit_xor(h1,bit_rshift(h1,13)) h1=bit_and(h1*0xc2b2ae35,0xFFFFFFFF) h1=bit_xor(h1,bit_rshift(h1,16))
-h2=bit_xor(h2,bit_rshift(h2,16)) h2=bit_and(h2*0x85ebca6b,0xFFFFFFFF) h2=bit_xor(h2,bit_rshift(h2,13)) h2=bit_and(h2*0xc2b2ae35,0xFFFFFFFF) h2=bit_xor(h2,bit_rshift(h2,16))
-h3=bit_xor(h3,bit_rshift(h3,16)) h3=bit_and(h3*0x85ebca6b,0xFFFFFFFF) h3=bit_xor(h3,bit_rshift(h3,13)) h3=bit_and(h3*0xc2b2ae35,0xFFFFFFFF) h3=bit_xor(h3,bit_rshift(h3,16))
-h4=bit_xor(h4,bit_rshift(h4,16)) h4=bit_and(h4*0x85ebca6b,0xFFFFFFFF) h4=bit_xor(h4,bit_rshift(h4,13)) h4=bit_and(h4*0xc2b2ae35,0xFFFFFFFF) h4=bit_xor(h4,bit_rshift(h4,16))
-return h1==_cs[1] and h2==_cs[2] and h3==_cs[3] and h4==_cs[4]
+h1=bit_xor(h1,len)h2=bit_xor(h2,len)h3=bit_xor(h3,len)h4=bit_xor(h4,len)
+h1=bit_and(h1+h2+h3+h4,0xFFFFFFFF)h2=bit_and(h2+h1,0xFFFFFFFF)h3=bit_and(h3+h1,0xFFFFFFFF)h4=bit_and(h4+h1,0xFFFFFFFF)
+h1=bit_xor(h1,bit_rshift(h1,16))h1=bit_and(h1*0x85ebca6b,0xFFFFFFFF)h1=bit_xor(h1,bit_rshift(h1,13))h1=bit_and(h1*0xc2b2ae35,0xFFFFFFFF)h1=bit_xor(h1,bit_rshift(h1,16))
+h2=bit_xor(h2,bit_rshift(h2,16))h2=bit_and(h2*0x85ebca6b,0xFFFFFFFF)h2=bit_xor(h2,bit_rshift(h2,13))h2=bit_and(h2*0xc2b2ae35,0xFFFFFFFF)h2=bit_xor(h2,bit_rshift(h2,16))
+h3=bit_xor(h3,bit_rshift(h3,16))h3=bit_and(h3*0x85ebca6b,0xFFFFFFFF)h3=bit_xor(h3,bit_rshift(h3,13))h3=bit_and(h3*0xc2b2ae35,0xFFFFFFFF)h3=bit_xor(h3,bit_rshift(h3,16))
+h4=bit_xor(h4,bit_rshift(h4,16))h4=bit_and(h4*0x85ebca6b,0xFFFFFFFF)h4=bit_xor(h4,bit_rshift(h4,13))h4=bit_and(h4*0xc2b2ae35,0xFFFFFFFF)h4=bit_xor(h4,bit_rshift(h4,16))
+return h1==_cs[1]and h2==_cs[2]and h3==_cs[3]and h4==_cs[4]
 end
-if ${this.integritySystem.getGuardCondition()} and _vcs() and ${opaqueGuard} then
-local vm=${vmName}.new(${bcVar},${bcKeyStr},${bcNonceStr},${ksVar})
+if not ${antiDbg} and ${predGuard} and _vcs()then
+local vm=${vmName}.new(${bcVar},${keyRecon},${bcNonceStr},${ksVar})
 vm:run()
 end
 end`;
@@ -2095,52 +1945,57 @@ end`;
 }
 
 class OclareEngine {
-    constructor() { this.version = '1.0'; }
+    constructor() { this.version = '2.0'; }
 
-    async process(code, options = {}) {
+    async process(code, options = {}, id = null) {
         const target = options.target || LuaTarget.LUA_53;
         const buildConfig = new BuildConfig(options.seed);
         await _sodiumReady;
+
+        postProgress(id, 'parse', 10, 'Parsing Lua source');
         const lexer = new LuaLexer(code, target);
         const tokens = lexer.tokenize();
         const parser = new LuaParser(tokens, target);
         const ast = parser.parse();
-        const vmArch = new VMArchitect(buildConfig, target);
+
+        postProgress(id, 'ir', 25, 'Lowering AST to IR');
         const irBuilder = new IRBuilder();
-        const irResult = irBuilder.lower(ast);
+        const irRaw = irBuilder.lower(ast);
+
+        postProgress(id, 'optimize', 35, 'Optimizing IR');
+        const optimizer = new IROptimizer();
+        const irResult = optimizer.optimize(irRaw);
+
+        postProgress(id, 'arch', 45, 'Generating VM architecture');
+        const vmArch = new VMArchitect(buildConfig, target);
+
+        postProgress(id, 'compile', 55, 'Compiling to bytecode');
         const compiler = new BytecodeCompiler(vmArch, target);
         const compiled = compiler.compile(irResult);
+
+        postProgress(id, 'encrypt', 70, 'Encrypting bytecode and constants');
         const integritySystem = new IntegritySystem(buildConfig);
         const cryptoSystem = new CryptoSystem(buildConfig, _sodium);
         const cfObfuscator = new ControlFlowObfuscator(buildConfig);
+
+        postProgress(id, 'obfuscate', 85, 'Assembling protected runtime');
         const obfuscator = new VMObfuscator(buildConfig, vmArch, target, integritySystem, cryptoSystem, cfObfuscator);
         const output = obfuscator.generateRuntime(compiled);
+
+        postProgress(id, 'done', 100, 'Complete');
         return {
-            code: output, target: target,
-            techniques: [
-                'AST->IR->Bytecode Pipeline','Semantic Displacement Per VM','Encrypted Stateful Handlers with Re-Keying',
-                'Real Self-Modifying Bytecode (JIT Un-XOR)','One-Shot Integrity Handlers','Runtime Entropy (Non-Deterministic)',
-                'Control-Flow Flattened Dispatcher','ChaCha20 Stream Cipher (256-bit)','XSalsa20-Poly1305 Authenticated Encryption',
-                'MurmurHash3 128-bit Integrity Checksum','Integrity-Woven Key Derivation','Anti-Debug / Anti-Hook Detection',
-                'Anti-Emulation (QEMU/Docker/Wine)','Sandbox Detection','Timing Attack Protection',
-                'Environment Integrity Verification','Runtime Opaque Predicates','Dead Code & Fake Handler Injection',
-                'Per-VM Immediate/Jump Encoding Keys','Conditional Inversion Per VM','Operand Order Displacement',
-                'Boxed-Cell Upvalue Model','Multi-Return Propagation (MRET)','String Length Obfuscation (Padded Encryption)',
-                '32-bit Jump Encoding (Overflow-Safe)','Bogus Execution Paths','Trap Opcodes'
-            ],
+            code: output,
+            target: target,
             stats: {
-                bytecodeSize: compiled.bytecode.length, constantsCount: compiled.constants.length,
-                irInstructions: irResult.instructions.length, closureCount: irResult.closures.length,
-                buildId: buildConfig.BUILD_ID, selectedVM: vmArch.selectedVM,
-                vmConfig: vmArch.activeConfig.name, vmStyle: vmArch.activeConfig.style,
-                wordSize: vmArch.activeConfig.wordSize, endianness: vmArch.activeConfig.endianness,
-                semanticDisplacement: {
-                    immediateKey: vmArch.activeConfig.immediateKey, jumpKey: vmArch.activeConfig.jumpKey,
-                    jumpRelative: vmArch.activeConfig.jumpRelative, invertConditionals: vmArch.activeConfig.invertConditionals,
-                    popOrderSwap: vmArch.activeConfig.popOrderSwap, addTransform: vmArch.activeConfig.addTransform,
-                    callConvention: vmArch.activeConfig.callConvention
-                },
-                target: target, encryptionMethod: _sodium ? 'xsalsa20poly1305' : 'chacha20', version: this.version
+                bytecodeSize: compiled.bytecode.length,
+                constantsCount: compiled.constants.length,
+                irInstructions: irResult.instructions.length,
+                closureCount: irResult.closures.length,
+                buildId: buildConfig.BUILD_ID,
+                opsUsed: compiled.usedOps.size,
+                target: target,
+                encryptionMethod: _sodium ? 'xsalsa20poly1305' : 'chacha20',
+                version: this.version
             }
         };
     }
@@ -2150,19 +2005,11 @@ self.onmessage = async function(ev) {
     const msg = ev.data || {};
     const id = msg.id || null;
     if (msg.type === 'poly' || msg.type === 'vm-only') {
-        postProgress(id, 'init', 0, 'Initializing Oclare Engine V1.0');
+        postProgress(id, 'init', 0, 'Initializing Oclare Engine V2.0');
         try {
             const engine = new OclareEngine();
-            postProgress(id, 'parse', 10, 'Parsing Lua source');
-            postProgress(id, 'ir', 25, 'Lowering AST to IR');
-            postProgress(id, 'compile', 40, 'Compiling IR to VM bytecode');
-            postProgress(id, 'displace', 55, 'Applying semantic displacement');
-            postProgress(id, 'encrypt', 70, 'Encrypting handlers and bytecode');
-            postProgress(id, 'integrity', 85, 'Generating integrity checks');
-            postProgress(id, 'obfuscate', 95, 'Assembling protected runtime');
-            const out = await engine.process(msg.code || '', msg.options || {});
-            postProgress(id, 'done', 100, 'Complete');
-            self.postMessage({ type: 'poly-result', id, lang: 'lua', code: out.code, stats: out.stats, techniques: out.techniques });
+            const out = await engine.process(msg.code || '', msg.options || {}, id);
+            self.postMessage({ type: 'poly-result', id, lang: 'lua', code: out.code, stats: out.stats });
         } catch (e) {
             self.postMessage({ type: 'error', id, error: e && e.message ? e.message : String(e) });
         }
@@ -2178,5 +2025,5 @@ self.addEventListener('error', (e) => {
 });
 
 if (typeof module !== 'undefined') {
-    module.exports = { LuaLexer, LuaParser, IRBuilder, IROp, BytecodeCompiler, VMArchitect, VMObfuscator, IntegritySystem, CryptoSystem, ControlFlowObfuscator, OclareEngine, BuildConfig, LuaTarget, LuaFeatures };
+    module.exports = { LuaLexer, LuaParser, IRBuilder, IROptimizer, IROp, BytecodeCompiler, VMArchitect, VMObfuscator, IntegritySystem, CryptoSystem, ControlFlowObfuscator, OclareEngine, BuildConfig, LuaTarget, LuaFeatures };
 }
