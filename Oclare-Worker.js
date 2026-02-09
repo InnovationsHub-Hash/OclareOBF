@@ -2180,19 +2180,3 @@ self.addEventListener('error', (e) => {
 if (typeof module !== 'undefined') {
     module.exports = { LuaLexer, LuaParser, IRBuilder, IROp, BytecodeCompiler, VMArchitect, VMObfuscator, IntegritySystem, CryptoSystem, ControlFlowObfuscator, OclareEngine, BuildConfig, LuaTarget, LuaFeatures };
 }
-self.onmessage = (e) => {
-  try {
-    const lua = e.data;
-
-    // whatever your obfuscation entry function is
-    const output = OCLARE_RUN(lua); // ← example name
-
-    self.postMessage({
-      result: output
-    });
-  } catch (err) {
-    self.postMessage({
-      result: "-- obfuscation failed --"
-    });
-  }
-};
