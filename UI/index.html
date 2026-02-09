@@ -96,7 +96,7 @@
     const outputBox = document.getElementById("output");
     const runBtn = document.getElementById("run");
 
-    const worker = new Worker("./Oclare-Worker.js");
+    const worker = new Worker("/Oclare-Worker.js");
 
     worker.onmessage = (e) => {
       outputBox.value = e.data.result;
