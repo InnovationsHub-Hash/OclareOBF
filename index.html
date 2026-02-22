@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>Oclare Obfuscator V2.0</title>
+<title>Oclare Obfuscator V1.0</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Orbitron:wght@600;800&display=swap" rel="stylesheet">
 <style>
@@ -15,6 +15,7 @@
     --secondary:#b44aff;
     --accent:#00d4ff;
     --success:#00ff88;
+    --error:#ff4444;
     --text:#fff;
     --muted:#8a8aa8;
 }
@@ -49,6 +50,39 @@ header{
     max-width:1200px;
     margin:0 auto;
     padding:20px;
+}
+.options-bar{
+    display:flex;
+    gap:14px;
+    margin-bottom:14px;
+    flex-wrap:wrap;
+    align-items:flex-end;
+}
+.option-group{
+    display:flex;
+    flex-direction:column;
+    gap:4px;
+}
+.option-group label{
+    font-size:10px;
+    letter-spacing:2px;
+    color:var(--muted);
+    text-transform:uppercase;
+}
+.option-group select,
+.option-group input[type="text"]{
+    padding:6px 10px;
+    font-size:11px;
+    font-family:'JetBrains Mono',monospace;
+    background:var(--panel2);
+    border:1px solid var(--border);
+    border-radius:6px;
+    color:var(--text);
+    outline:none;
+}
+.option-group select:focus,
+.option-group input[type="text"]:focus{
+    border-color:var(--primary);
 }
 .grid{
     display:grid;
@@ -101,6 +135,10 @@ header{
     background:var(--success);
     color:#000;
 }
+.panel-actions button.hidden-btn{
+    opacity:0.3;
+    pointer-events:none;
+}
 textarea{
     flex:1;
     background:transparent;
@@ -116,6 +154,9 @@ textarea::placeholder{color:#555}
 textarea.output{
     color:var(--success);
     font-size:10px;
+}
+textarea.output.has-error{
+    color:var(--error);
 }
 .controls{
     margin:16px 0;
@@ -192,6 +233,9 @@ footer{
 }
 @media(max-width:900px){
     .grid{grid-template-columns:1fr}
+    textarea{min-height:200px}
+    .options-bar{gap:8px}
+    .option-group{flex:1;min-width:120px}
 }
 </style>
 </head>
@@ -199,25 +243,47 @@ footer{
 
 <header>
     <div class="logo">OCLARE</div>
-    <div class="tag">V2.0 · Lua VM Obfuscator</div>
+    <div class="tag">V1.0 &middot; Lua VM Obfuscator</div>
 </header>
 
 <div class="container">
+
+    <div class="options-bar">
+        <div class="option-group">
+            <label>Target</label>
+            <select id="targetSelect">
+                <option value="lua51">Lua 5.1</option>
+                <option value="lua52">Lua 5.2</option>
+                <option value="lua53" selected>Lua 5.3</option>
+                <option value="lua54">Lua 5.4</option>
+                <option value="luajit">LuaJIT</option>
+                <option value="luau">Luau</option>
+            </select>
+        </div>
+        <div class="option-group">
+            <label>Seed (optional)</label>
+            <input type="text" id="seedInput" placeholder="Random" maxlength="64">
+        </div>
+        <div class="option-group">
+            <label>Filename</label>
+            <input type="text" id="filenameInput" placeholder="obfuscated.lua" value="obfuscated.lua">
+        </div>
+    </div>
 
     <div class="grid">
         <div class="panel">
             <div class="panel-header">
                 <h3>Input Lua</h3>
             </div>
-            <textarea id="input" placeholder="print('hello world')"></textarea>
+            <textarea id="input" placeholder="print('hello world')" maxlength="5242880"></textarea>
         </div>
 
         <div class="panel">
             <div class="panel-header">
                 <h3>Obfuscated Output</h3>
                 <div class="panel-actions">
-                    <button id="copyBtn" onclick="copyOutput()">COPY</button>
-                    <button id="dlBtn" onclick="downloadOutput()">DOWNLOAD</button>
+                    <button id="copyBtn" class="hidden-btn" onclick="copyOutput()">COPY</button>
+                    <button id="dlBtn" class="hidden-btn" onclick="downloadOutput()">DOWNLOAD</button>
                 </div>
             </div>
             <textarea id="output" class="output" readonly placeholder="Protected code appears here..."></textarea>
@@ -239,11 +305,11 @@ footer{
 </div>
 
 <footer>
-    Oclare Obfuscator · Made by hippo :D · V2
+    Oclare Obfuscator &middot; Made by hippo :D &middot; V1
 </footer>
 
 <script>
-const worker = new Worker('./Oclare-Worker.js');
+let worker = null;
 const input = document.getElementById('input');
 const output = document.getElementById('output');
 const btn = document.getElementById('obfBtn');
@@ -252,12 +318,63 @@ const sizeEl = document.getElementById('size');
 const progressBar = document.getElementById('progressBar');
 const progressFill = document.getElementById('progressFill');
 const progressLabel = document.getElementById('progressLabel');
+const copyBtn = document.getElementById('copyBtn');
+const dlBtn = document.getElementById('dlBtn');
+const targetSelect = document.getElementById('targetSelect');
+const seedInput = document.getElementById('seedInput');
+const filenameInput = document.getElementById('filenameInput');
 
 let start = 0;
 
+function createWorker() {
+    if (worker) worker.terminate();
+    worker = new Worker('./Oclare-Worker.js');
+    worker.onmessage = handleMessage;
+    worker.onerror = handleError;
+}
+
+function handleMessage(e) {
+    const d = e.data;
+    if (d.type === 'progress') {
+        progressFill.style.width = d.pct + '%';
+        progressLabel.textContent = d.msg;
+    } else if (d.type === 'poly-result') {
+        output.value = d.code;
+        output.classList.remove('has-error');
+        timeEl.textContent = Math.round(performance.now() - start) + 'ms';
+        const bytes = new Blob([d.code]).size;
+        sizeEl.textContent = bytes > 1024 ? (bytes/1024).toFixed(1)+' KB' : bytes+' B';
+        showOutputButtons(true);
+        finish();
+    } else if (d.type === 'error') {
+        output.value = 'Error: ' + (d.error || 'Unknown error');
+        output.classList.add('has-error');
+        showOutputButtons(false);
+        finish();
+    }
+}
+
+function handleError(error) {
+    output.value = 'Worker error: ' + (error.message || 'Unknown error');
+    output.classList.add('has-error');
+    showOutputButtons(false);
+    finish();
+    createWorker();
+}
+
+function showOutputButtons(show) {
+    copyBtn.classList.toggle('hidden-btn', !show);
+    dlBtn.classList.toggle('hidden-btn', !show);
+}
+
 btn.onclick = () => {
     const code = input.value.trim();
-    if(!code) return;
+    if (!code) return;
+    if (code.length > 5 * 1024 * 1024) {
+        output.value = 'Error: Input exceeds 5MB limit';
+        output.classList.add('has-error');
+        return;
+    }
 
     btn.disabled = true;
     btn.textContent = 'PROCESSING\u2026';
@@ -265,36 +382,24 @@ btn.onclick = () => {
     progressLabel.classList.add('active');
     progressFill.style.width = '0%';
     progressLabel.textContent = 'Initializing...';
+    showOutputButtons(false);
 
     start = performance.now();
+
+    const options = {
+        target: targetSelect.value
+    };
+    const seed = seedInput.value.trim();
+    if (seed) options.seed = seed;
+
+    createWorker();
 
     worker.postMessage({
         type: 'poly',
         code: code,
+        options: options,
         id: 'main'
     });
-};
-
-worker.onmessage = e => {
-    const d = e.data;
-    if (d.type === 'progress') {
-        progressFill.style.width = d.pct + '%';
-        progressLabel.textContent = d.msg;
-    } else if (d.type === 'poly-result') {
-        output.value = d.code;
-        timeEl.textContent = Math.round(performance.now() - start) + 'ms';
-        const bytes = new Blob([d.code]).size;
-        sizeEl.textContent = bytes > 1024 ? (bytes/1024).toFixed(1)+' KB' : bytes+' B';
-        finish();
-    } else if (d.type === 'error') {
-        output.value = 'Error: ' + d.error;
-        finish();
-    }
-};
-
-worker.onerror = (error) => {
-    output.value = 'Worker error: ' + error.message;
-    finish();
 };
 
 function finish() {
@@ -306,28 +411,29 @@ function finish() {
 
 function copyOutput() {
     const text = output.value;
-    if (!text) return;
+    if (!text || output.classList.contains('has-error')) return;
     navigator.clipboard.writeText(text).then(() => {
-        const b = document.getElementById('copyBtn');
-        b.textContent = 'COPIED';
-        b.classList.add('copied');
-        setTimeout(() => { b.textContent = 'COPY'; b.classList.remove('copied'); }, 1500);
+        copyBtn.textContent = 'COPIED';
+        copyBtn.classList.add('copied');
+        setTimeout(() => { copyBtn.textContent = 'COPY'; copyBtn.classList.remove('copied'); }, 1500);
     });
 }
 
 function downloadOutput() {
     const text = output.value;
-    if (!text) return;
+    if (!text || output.classList.contains('has-error')) return;
     const blob = new Blob([text], {type:'text/plain'});
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = 'obfuscated.lua';
+    a.download = filenameInput.value.trim() || 'obfuscated.lua';
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
 }
+
+createWorker();
 </script>
 
 </body>

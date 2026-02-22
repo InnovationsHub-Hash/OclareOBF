@@ -40,7 +40,7 @@ class BuildConfig {
         this.BUILD_TIMESTAMP = Date.now();
         this.entropy = this._gatherEntropy();
         this.BUILD_SEED = seed || (this.BUILD_TIMESTAMP.toString(36) + this.entropy);
-        this.BUILD_ID = this.fnv1a(this.BUILD_SEED);
+        this.BUILD_ID = this.fnv1a(this.BUILD_SEED).toString(16);
         this.rngState = new Uint32Array(4);
         this._initRng(this.BUILD_SEED);
         this._mixEntropy();
@@ -49,7 +49,7 @@ class BuildConfig {
 
     _gatherEntropy() {
         let e = '';
-        e += Math.random().toString(36).substr(2, 16);
+        e += Math.random().toString(36).substring(2, 16);
         e += Date.now().toString(36);
         e += (typeof performance !== 'undefined' && performance.now) ? performance.now().toString(36) : '';
         try {
@@ -60,7 +60,7 @@ class BuildConfig {
             }
         } catch (_) {}
         e += (typeof self !== 'undefined' ? Object.keys(self).length : 0).toString(36);
-        e += Math.random().toString(36).substr(2, 8);
+        e += Math.random().toString(36).substring(2, 8);
         return e;
     }
 
@@ -629,9 +629,10 @@ class IRBuilder {
     placeLabel(name) { this.ir(IROp.LABEL, { name }); }
 
     addConstant(value) {
-        for (let i = 0; i < this.constants.length; i++) {
-            if (this.constants[i] === value) return i;
-            if (typeof this.constants[i] === 'object' && typeof value === 'object' && JSON.stringify(this.constants[i]) === JSON.stringify(value)) return i;
+        if (typeof value !== 'object' || value === null) {
+            for (let i = 0; i < this.constants.length; i++) {
+                if (this.constants[i] === value) return i;
+            }
         }
         this.constants.push(value);
         return this.constants.length - 1;
@@ -712,7 +713,7 @@ class IRBuilder {
     lower_Assignment(node) {
         for (let i = 0; i < node.values.length; i++) this.lowerNode(node.values[i]);
         for (let i = node.values.length; i < node.targets.length; i++) this.ir(IROp.LOAD_NIL);
-        for (let i = node.targets.length - 1; i >= 0; i--) this.lowerAssignTarget(node.targets[i]);
+        for (let i = 0; i < node.targets.length; i++) this.lowerAssignTarget(node.targets[i]);
     }
 
     lowerAssignTarget(target) {
@@ -842,11 +843,11 @@ class IRBuilder {
         const padCount = 3 - node.exprs.length;
         for (let i = 0; i < padCount; i++) this.ir(IROp.LOAD_NIL);
         this.addLocal('(iter)');
-        this.ir(IROp.STORE_LOCAL, { index: this.resolveLocal('(iter)') });
         this.addLocal('(state)');
-        this.ir(IROp.STORE_LOCAL, { index: this.resolveLocal('(state)') });
         this.addLocal('(control)');
         this.ir(IROp.STORE_LOCAL, { index: this.resolveLocal('(control)') });
+        this.ir(IROp.STORE_LOCAL, { index: this.resolveLocal('(state)') });
+        this.ir(IROp.STORE_LOCAL, { index: this.resolveLocal('(iter)') });
         for (const name of node.names) this.addLocal(name);
         const loopLabel = this.newLabel();
         const endLabel = this.newLabel();
@@ -966,6 +967,10 @@ class IRBuilder {
 
     lower_Grouped(node) { this.lowerNode(node.expression); }
 
+    lower_SimpleType() {}
+    lower_GenericType() {}
+    lower_UnionType() {}
+
     lower_BinaryOp(node) {
         if (node.op === 'and') {
             const endLabel = this.newLabel();
@@ -1082,6 +1087,7 @@ class IROptimizer {
 
     constantFold(instructions, constants) {
         let changed = false;
+        constants = [...constants];
         const result = [];
         for (let i = 0; i < instructions.length; i++) {
             const inst = instructions[i];
@@ -1147,11 +1153,10 @@ class IROptimizer {
                     continue;
                 }
                 if (prev.op === IROp.STORE_LOCAL && inst.op === IROp.LOAD_LOCAL && prev.index === inst.index) {
+                    result.pop();
                     result.push({ op: IROp.DUP });
                     result.push(prev);
-                    result.pop();
-                    result.pop();
-                    result.push(prev);
+                    changed = true;
                     continue;
                 }
                 if (prev.op === IROp.JUMP && inst.op === IROp.LABEL && prev.label === inst.name) {
@@ -1178,13 +1183,10 @@ class IROptimizer {
         let dead = false;
         for (const inst of instructions) {
             if (inst.op === IROp.LABEL) {
-                if (labels.has(inst.name) || !dead) {
+                result.push(inst);
+                if (labels.has(inst.name)) {
                     dead = false;
-                    result.push(inst);
-                } else {
-                    result.push(inst);
                 }
-                dead = false;
                 continue;
             }
             if (dead) { changed = true; continue; }
@@ -1287,15 +1289,15 @@ class BytecodeCompiler {
                 case IROp.INIT_LOCAL:
                     emitOp('INITLOC'); emitByte(inst.index & 0xFF); break;
                 case IROp.LOAD_CONST:
-                    emitOp('LDK'); emitWord(inst.constIdx); break;
+                    emitOp('LDK'); emitWord(inst.constIdx + 1); break;
                 case IROp.LOAD_LOCAL:
                     emitOp('LDLOC'); emitByte(inst.index & 0xFF); break;
                 case IROp.STORE_LOCAL:
                     emitOp('STLOC'); emitByte(inst.index & 0xFF); break;
                 case IROp.LOAD_GLOBAL:
-                    emitOp('LDGLOB'); emitWord(inst.constIdx); break;
+                    emitOp('LDGLOB'); emitWord(inst.constIdx + 1); break;
                 case IROp.STORE_GLOBAL:
-                    emitOp('STGLOB'); emitWord(inst.constIdx); break;
+                    emitOp('STGLOB'); emitWord(inst.constIdx + 1); break;
                 case IROp.LOAD_UPVALUE:
                     emitOp('LDUP'); emitByte(inst.index & 0xFF); break;
                 case IROp.STORE_UPVALUE:
@@ -1318,11 +1320,11 @@ class BytecodeCompiler {
                 case IROp.MRET:
                     emitOp('MRET'); emitByte(inst.count & 0xFF); break;
                 case IROp.SELF_CALL:
-                    emitOp('LDK'); emitWord(inst.constIdx); emitOp('SELF'); break;
+                    emitOp('LDK'); emitWord(inst.constIdx + 1); emitOp('SELF'); break;
                 case IROp.RETURN:
                     emitOp('RET'); emitByte(inst.count & 0xFF); break;
                 case IROp.CLOSURE:
-                    emitOp('CLOS'); emitWord(inst.constIdx); break;
+                    emitOp('CLOS'); emitWord(inst.constIdx + 1); break;
             }
         }
 
@@ -1395,12 +1397,6 @@ class CryptoSystem {
     }
 
     encrypt(data) {
-        if (this.sodium) {
-            const plaintext = new Uint8Array(data);
-            const nonce = this._nextNonce(24);
-            const ciphertext = this.sodium.crypto_secretbox_easy(plaintext, nonce, this.key);
-            return { data: Array.from(ciphertext), nonce: Array.from(nonce), key: Array.from(this.key), method: 'xsalsa20poly1305' };
-        }
         const nonce = this._nextNonce(12);
         const keyBytes = Array.from(this.key);
         const encrypted = this._chacha20Encrypt(data, keyBytes, Array.from(nonce));
@@ -1582,7 +1578,7 @@ class ControlFlowObfuscator {
                 }
                 case 2: {
                     const n = this.buildConfig.seededRandomInt(3, 97);
-                    expr = `(bit_and(bit_or(${n},bit_not(${n})),0xFFFFFFFF)~=0)`;
+                    expr = `(bit_xor(${n},${n})==0)`;
                     break;
                 }
                 case 3: {
@@ -1677,7 +1673,7 @@ class VMObfuscator {
         const popSwap = config.popOrderSwap;
 
         const readJump = jmpRel
-            ? `(function()local _o=${rw} _o=bit_xor(_o,${jmpKey})return s._pc+_o end)()`
+            ? `(function()local _o=${rw} _o=bit_xor(_o,${jmpKey})if _o>=2147483648 then _o=_o-4294967296 end return s._pc+_o end)()`
             : `bit_xor(${rw},${jmpKey})`;
 
         const readImm = `bit_xor(${rw},${immKey})`;
@@ -1697,11 +1693,11 @@ class VMObfuscator {
             'SWAP': `local b,a=s:pop(),s:pop() s:push(b) s:push(a)`,
             'ROT3': `local c,b,a=s:pop(),s:pop(),s:pop() s:push(b) s:push(c) s:push(a)`,
             'JMP': `s._pc=${readJump}`,
-            'JT': `local _t=${readJump} if s:pop() then s._pc=_t end`,
-            'JF': `local _t=${readJump} if not s:pop() then s._pc=_t end`,
-            'JNIL': `local _t=${readJump} if s:peek()==nil then s._pc=_t end`,
+            'JT': config.invertConditionals ? `local _t=${readJump} if not s:pop() then s._pc=_t end` : `local _t=${readJump} if s:pop() then s._pc=_t end`,
+            'JF': config.invertConditionals ? `local _t=${readJump} if s:pop() then s._pc=_t end` : `local _t=${readJump} if not s:pop() then s._pc=_t end`,
+            'JNIL': `local _t=${readJump} local _jv=s:pop()if _jv==nil then s._pc=_t else s:push(_jv)end`,
             'LOOP': `local st,lim,v=s:pop(),s:pop(),s:pop() s:push((st>0 and v<=lim)or(st<0 and v>=lim)or(st==0))`,
-            'TFOR': `local _n=s:r8()local _ii=s:r8()local _si=s:r8()local _ci=s:r8()local _iter=s._L[_ii]and s._L[_ii].v or nil local _state=s._L[_si]and s._L[_si].v or nil local _ctl=s._L[_ci]and s._L[_ci].v or nil local _res={_iter(_state,_ctl)}for _i=1,_n do if not s._L[_ci+_i]then s._L[_ci+_i]={v=nil}end s._L[_ci+_i].v=_res[_i]end if s._L[_ci]then s._L[_ci].v=_res[1]end`,
+            'TFOR': `local _n=s:r8()local _ii=s:r8()local _si=s:r8()local _ci=s:r8()local _iter=s._L[_ii]and s._L[_ii].v or nil local _state=s._L[_si]and s._L[_si].v or nil local _ctl=s._L[_ci]and s._L[_ci].v or nil local _res={_iter(_state,_ctl)}for _i=_n,1,-1 do s:push(_res[_i])end`,
             'INITLOC': `local _i=s:r8()if not s._L[_i]then s._L[_i]={v=nil}end`,
             'LDLOC': `local _i=s:r8()local _c=s._L[_i]s:push(_c and _c.v or nil)`,
             'STLOC': `local _i=s:r8()if not s._L[_i]then s._L[_i]={v=nil}end s._L[_i].v=s:pop()`,
@@ -1714,11 +1710,11 @@ class VMObfuscator {
             'SETTBL': `local v,k,t=s:pop(),s:pop(),s:pop()t[k]=v`,
             'CALL': (() => {
                 if (config.callConvention === 'reversed') {
-                    return `local n=s:r8()local args={}for i=n,1,-1 do args[i]=s:pop()end local f=s:pop()local ok,res=pcall(function()return{f(unpack(args,1,n))}end)if ok and res then for i=1,#res do s:push(res[i])end s:push(#res)else s:push(nil)s:push(1)end`;
+                    return `local n=s:r8()local args={}for i=n,1,-1 do args[i]=s:pop()end local f=s:pop()local res={f(unpack(args,1,n))}for i=1,#res do s:push(res[i])end s:push(#res)`;
                 }
                 return `local n=s:r8()local args={}for i=n,1,-1 do args[i]=s:pop()end local f=s:pop()local res={f(unpack(args,1,n))}for i=1,#res do s:push(res[i])end s:push(#res)`;
             })(),
-            'MRET': `local want=s:r8()local got=s:pop()or 0 if got<want then for _mi=1,want-got do s:push(nil)end elseif got>want then for _mi=1,got-want do local _t=s._stk[#s._stk-want]s._stk[#s._stk-want]=nil end end`,
+            'MRET': `local want=s:r8()local got=s:pop()or 0 local _rv={}for _mi=got,1,-1 do _rv[_mi]=s:pop()end for _mi=1,want do s:push(_rv[_mi])end`,
             'RET': `local n=s:r8()local res={}for i=n,1,-1 do res[i]=s:pop()end s._run=false return unpack(res,1,n)`,
             'CLOS': `local fi=${readImm} local fd=s._K[fi]local _pL=s._L s:push(function(...)local _nvm=s._vm.new(fd._bc,fd._bk,fd._bn,fd._k)_nvm._U={}for _ck,_cv in pairs(_pL)do _nvm._U[_ck]=_cv end local _a={...}local _ac=select("#",...)for _ai=1,fd._p do if not _nvm._L[_ai-1]then _nvm._L[_ai-1]={v=nil}end _nvm._L[_ai-1].v=_a[_ai]end if fd._va==1 then _nvm._va={}for _vi=fd._p+1,_ac do _nvm._va[_vi-fd._p]=_a[_vi]end end return _nvm:run()end)`,
             'SELF': `local k,t=s:pop(),s:peek()s:push(t[k])`,
@@ -1742,7 +1738,7 @@ class VMObfuscator {
             'CONCAT': `${binPop} s:push(tostring(a)..tostring(b))`,
             'NOP': ``,
             'HALT': `s._run=false`,
-            'VARG': `if s._va then for _vi=1,#s._va do s:push(s._va[_vi])end else s:push(nil)end`,
+            'VARG': `if s._va then for _vi=1,#s._va do s:push(s._va[_vi])end s:push(#s._va)else s:push(nil)s:push(1)end`,
             'NOT': `s:push(not s:pop())`,
             'REKEY': `s._rkc=(s._rkc or 0)+1`,
             'SMBC': `local _si=s:r8()local _sv=s:r8()local _sn=s:r8()for _sj=0,_sn-1 do if s._C[_si+_sj]then s._C[_si+_sj]=bit_xor(s._C[_si+_sj],_sv)end end`
@@ -1778,11 +1774,10 @@ class VMObfuscator {
 
     applySelfModifyPass(bytecodeArray) {
         const keys = this.vmArch.config.smXorKeys;
-        const smOp = this.vmArch.getOpcode('SMBC');
         const regions = [];
         const regionCount = this.buildConfig.seededRandomInt(2, 5);
         for (let r = 0; r < regionCount; r++) {
-            if (bytecodeArray.length < 25) break;
+            if (bytecodeArray.length < 30) break;
             const start = this.buildConfig.seededRandomInt(10, Math.max(11, bytecodeArray.length - 15));
             const len = this.buildConfig.seededRandomInt(2, 5);
             if (start + len >= bytecodeArray.length) continue;
@@ -1801,17 +1796,7 @@ class VMObfuscator {
                 }
             }
         }
-        regions.sort((a, b) => b.start - a.start);
-        for (const region of regions) {
-            const smBytes = [smOp, (region.start + 4) & 0xFF, region.mask & 0xFF, region.len & 0xFF];
-            bytecodeArray.splice(region.start, 0, ...smBytes);
-            for (const other of regions) {
-                if (other !== region && other.start >= region.start) {
-                    other.start += 4;
-                }
-            }
-        }
-        return bytecodeArray;
+        return { bytecode: bytecodeArray, smRegions: regions };
     }
 
     serializeConstants(encConstants) {
@@ -1830,7 +1815,9 @@ class VMObfuscator {
 
     generateRuntime(compiled) {
         let bcBytes = [...compiled.bytecode];
-        bcBytes = this.applySelfModifyPass(bcBytes);
+        const smResult = this.applySelfModifyPass(bcBytes);
+        bcBytes = smResult.bytecode;
+        const smRegions = smResult.smRegions;
         const encBytecode = this.encryptBytecode(bcBytes);
         const encConstants = this.encryptConstants(compiled.constants);
         const checksum = this.integritySystem.computeChecksum(bcBytes);
@@ -1858,16 +1845,19 @@ class VMObfuscator {
 
         const antiDbg = this.genVar('ad');
         const envChk = this.genVar('ec');
-        const rekeyFn = this.genVar('rk');
+        const rekeyFn = this.genVar('rf');
         const rekeyInterval = config.rekeyInterval;
+
+        const smRegionsStr = smRegions.length > 0 ? `{${smRegions.map(r => '{' + (r.start+1) + ',' + r.mask + ',' + r.len + '}').join(',')}}` : 'nil';
 
         return `do
 ${this.generateBitLib()}
 ${this.generateTableUnpack()}
 local ${antiDbg}=false
-do local _ok,_=pcall(function()if debug and debug.getinfo then local i=debug.getinfo(1)if i and i.what=="C"then ${antiDbg}=true end end if debug and debug.gethook then local h=debug.gethook and debug.gethook()if h then ${antiDbg}=true end end end)end
-local ${envChk}=true
+do local _ok,_=pcall(function()if debug and debug.gethook then local h,m=debug.gethook()if h or(m and m~="")then ${antiDbg}=true end end end)end
+local ${envChk}
 do local _ef={"print","pairs","ipairs","next","type","tostring","tonumber","select","rawget","rawset","getmetatable","setmetatable","pcall","xpcall","error","assert"}local _es={}for _,k in ipairs(_ef)do if _G[k]then _es[k]=tostring(_G[k])end end ${envChk}=function()for k,v in pairs(_es)do if not _G[k]or tostring(_G[k])~=v then return false end end return true end end
+local function _mul32(a,b)a=bit_and(a,0xFFFFFFFF)b=bit_and(b,0xFFFFFFFF)local ah=bit_rshift(a,16)local al=bit_and(a,0xFFFF)local bh=bit_rshift(b,16)local bl=bit_and(b,0xFFFF)local lo=al*bl local mid=bit_and(ah*bl+al*bh,0xFFFF)return bit_and(lo+bit_lshift(mid,16),0xFFFFFFFF)end
 local function _rotl(x,n)x=bit_and(x,0xFFFFFFFF)return bit_or(bit_lshift(x,n),bit_rshift(x,32-n))end
 local function _qr(s,a,b,c,d)s[a]=bit_and(s[a]+s[b],0xFFFFFFFF)s[d]=_rotl(bit_xor(s[d],s[a]),16)s[c]=bit_and(s[c]+s[d],0xFFFFFFFF)s[b]=_rotl(bit_xor(s[b],s[c]),12)s[a]=bit_and(s[a]+s[b],0xFFFFFFFF)s[d]=_rotl(bit_xor(s[d],s[a]),8)s[c]=bit_and(s[c]+s[d],0xFFFFFFFF)s[b]=_rotl(bit_xor(s[b],s[c]),7)end
 local function _cc20(kw,nw,ctr)local s={0x61707865,0x3320646e,0x79622d32,0x6b206574,kw[1],kw[2],kw[3],kw[4],kw[5],kw[6],kw[7],kw[8],ctr,nw[1],nw[2],nw[3]}local w={}for i=1,16 do w[i]=s[i]end for _=1,10 do _qr(w,1,5,9,13)_qr(w,2,6,10,14)_qr(w,3,7,11,15)_qr(w,4,8,12,16)_qr(w,1,6,11,16)_qr(w,2,7,12,13)_qr(w,3,8,9,14)_qr(w,4,5,10,15)end local b={}for i=1,16 do local v=bit_and(w[i]+s[i],0xFFFFFFFF)b[#b+1]=bit_and(v,0xFF)b[#b+1]=bit_and(bit_rshift(v,8),0xFF)b[#b+1]=bit_and(bit_rshift(v,16),0xFF)b[#b+1]=bit_and(bit_rshift(v,24),0xFF)end return b end
@@ -1888,7 +1878,7 @@ local function _dk(ks)local r={}for i,c in ipairs(ks)do if c.t=="s"then r[i]=_ds
 local function _dbc(bc,k,n)return _dec(bc,type(k)=="table"and k or{k},type(n)=="table"and n or{})end
 local ${vmName}={}
 ${vmName}.__index=${vmName}
-function ${vmName}.new(bc,bk,bn,ks)local s=setmetatable({},${vmName})s._C=_dbc(bc,bk,bn)s._K=_dk(ks)s._stk={}s._L={}s._U=nil s._va=nil s._G=_G s._pc=1 s._run=true s._vm=${vmName} s._rkc=0 return s end
+function ${vmName}.new(bc,bk,bn,ks,sm)local s=setmetatable({},${vmName})s._C=_dbc(bc,bk,bn)s._K=_dk(ks)s._stk={}s._L={}s._U=nil s._va=nil s._G=_G s._pc=1 s._run=true s._vm=${vmName} s._rkc=0 if sm then for _,r in ipairs(sm)do for _si=0,r[3]-1 do if s._C[r[1]+_si]then s._C[r[1]+_si]=bit_xor(s._C[r[1]+_si],r[2])end end end end return s end
 function ${vmName}:push(v)self._stk[#self._stk+1]=v end
 function ${vmName}:pop()local v=self._stk[#self._stk]self._stk[#self._stk]=nil return v end
 function ${vmName}:peek()return self._stk[#self._stk]end
@@ -1919,25 +1909,25 @@ local k1=bit_or(bit_or(bit_or(bc[i]or 0,bit_lshift(bc[i+1]or 0,8)),bit_lshift(bc
 local k2=bit_or(bit_or(bit_or(bc[i+4]or 0,bit_lshift(bc[i+5]or 0,8)),bit_lshift(bc[i+6]or 0,16)),bit_lshift(bc[i+7]or 0,24))
 local k3=bit_or(bit_or(bit_or(bc[i+8]or 0,bit_lshift(bc[i+9]or 0,8)),bit_lshift(bc[i+10]or 0,16)),bit_lshift(bc[i+11]or 0,24))
 local k4=bit_or(bit_or(bit_or(bc[i+12]or 0,bit_lshift(bc[i+13]or 0,8)),bit_lshift(bc[i+14]or 0,16)),bit_lshift(bc[i+15]or 0,24))
-k1=bit_and(k1*0x239b961b,0xFFFFFFFF)k1=bit_or(bit_lshift(k1,15),bit_rshift(k1,17))k1=bit_and(k1*0xab0e9789,0xFFFFFFFF)h1=bit_xor(h1,k1)
-h1=bit_or(bit_lshift(h1,19),bit_rshift(h1,13))h1=bit_and(h1+h2,0xFFFFFFFF)h1=bit_and(h1*5+0x561ccd1b,0xFFFFFFFF)
-k2=bit_and(k2*0xab0e9789,0xFFFFFFFF)k2=bit_or(bit_lshift(k2,16),bit_rshift(k2,16))k2=bit_and(k2*0x38b34ae5,0xFFFFFFFF)h2=bit_xor(h2,k2)
-h2=bit_or(bit_lshift(h2,17),bit_rshift(h2,15))h2=bit_and(h2+h3,0xFFFFFFFF)h2=bit_and(h2*5+0x0bcaa747,0xFFFFFFFF)
-k3=bit_and(k3*0x38b34ae5,0xFFFFFFFF)k3=bit_or(bit_lshift(k3,17),bit_rshift(k3,15))k3=bit_and(k3*0xa1e38b93,0xFFFFFFFF)h3=bit_xor(h3,k3)
-h3=bit_or(bit_lshift(h3,15),bit_rshift(h3,17))h3=bit_and(h3+h4,0xFFFFFFFF)h3=bit_and(h3*5+0x96cd1c35,0xFFFFFFFF)
-k4=bit_and(k4*0xa1e38b93,0xFFFFFFFF)k4=bit_or(bit_lshift(k4,18),bit_rshift(k4,14))k4=bit_and(k4*0x239b961b,0xFFFFFFFF)h4=bit_xor(h4,k4)
-h4=bit_or(bit_lshift(h4,13),bit_rshift(h4,19))h4=bit_and(h4+h1,0xFFFFFFFF)h4=bit_and(h4*5+0x32ac3b17,0xFFFFFFFF)
+k1=_mul32(k1,0x239b961b)k1=bit_or(bit_lshift(k1,15),bit_rshift(k1,17))k1=_mul32(k1,0xab0e9789)h1=bit_xor(h1,k1)
+h1=bit_or(bit_lshift(h1,19),bit_rshift(h1,13))h1=bit_and(h1+h2,0xFFFFFFFF)h1=bit_and(_mul32(h1,5)+0x561ccd1b,0xFFFFFFFF)
+k2=_mul32(k2,0xab0e9789)k2=bit_or(bit_lshift(k2,16),bit_rshift(k2,16))k2=_mul32(k2,0x38b34ae5)h2=bit_xor(h2,k2)
+h2=bit_or(bit_lshift(h2,17),bit_rshift(h2,15))h2=bit_and(h2+h3,0xFFFFFFFF)h2=bit_and(_mul32(h2,5)+0x0bcaa747,0xFFFFFFFF)
+k3=_mul32(k3,0x38b34ae5)k3=bit_or(bit_lshift(k3,17),bit_rshift(k3,15))k3=_mul32(k3,0xa1e38b93)h3=bit_xor(h3,k3)
+h3=bit_or(bit_lshift(h3,15),bit_rshift(h3,17))h3=bit_and(h3+h4,0xFFFFFFFF)h3=bit_and(_mul32(h3,5)+0x96cd1c35,0xFFFFFFFF)
+k4=_mul32(k4,0xa1e38b93)k4=bit_or(bit_lshift(k4,18),bit_rshift(k4,14))k4=_mul32(k4,0x239b961b)h4=bit_xor(h4,k4)
+h4=bit_or(bit_lshift(h4,13),bit_rshift(h4,19))h4=bit_and(h4+h1,0xFFFFFFFF)h4=bit_and(_mul32(h4,5)+0x32ac3b17,0xFFFFFFFF)
 end
 h1=bit_xor(h1,len)h2=bit_xor(h2,len)h3=bit_xor(h3,len)h4=bit_xor(h4,len)
 h1=bit_and(h1+h2+h3+h4,0xFFFFFFFF)h2=bit_and(h2+h1,0xFFFFFFFF)h3=bit_and(h3+h1,0xFFFFFFFF)h4=bit_and(h4+h1,0xFFFFFFFF)
-h1=bit_xor(h1,bit_rshift(h1,16))h1=bit_and(h1*0x85ebca6b,0xFFFFFFFF)h1=bit_xor(h1,bit_rshift(h1,13))h1=bit_and(h1*0xc2b2ae35,0xFFFFFFFF)h1=bit_xor(h1,bit_rshift(h1,16))
-h2=bit_xor(h2,bit_rshift(h2,16))h2=bit_and(h2*0x85ebca6b,0xFFFFFFFF)h2=bit_xor(h2,bit_rshift(h2,13))h2=bit_and(h2*0xc2b2ae35,0xFFFFFFFF)h2=bit_xor(h2,bit_rshift(h2,16))
-h3=bit_xor(h3,bit_rshift(h3,16))h3=bit_and(h3*0x85ebca6b,0xFFFFFFFF)h3=bit_xor(h3,bit_rshift(h3,13))h3=bit_and(h3*0xc2b2ae35,0xFFFFFFFF)h3=bit_xor(h3,bit_rshift(h3,16))
-h4=bit_xor(h4,bit_rshift(h4,16))h4=bit_and(h4*0x85ebca6b,0xFFFFFFFF)h4=bit_xor(h4,bit_rshift(h4,13))h4=bit_and(h4*0xc2b2ae35,0xFFFFFFFF)h4=bit_xor(h4,bit_rshift(h4,16))
+h1=bit_xor(h1,bit_rshift(h1,16))h1=_mul32(h1,0x85ebca6b)h1=bit_xor(h1,bit_rshift(h1,13))h1=_mul32(h1,0xc2b2ae35)h1=bit_xor(h1,bit_rshift(h1,16))
+h2=bit_xor(h2,bit_rshift(h2,16))h2=_mul32(h2,0x85ebca6b)h2=bit_xor(h2,bit_rshift(h2,13))h2=_mul32(h2,0xc2b2ae35)h2=bit_xor(h2,bit_rshift(h2,16))
+h3=bit_xor(h3,bit_rshift(h3,16))h3=_mul32(h3,0x85ebca6b)h3=bit_xor(h3,bit_rshift(h3,13))h3=_mul32(h3,0xc2b2ae35)h3=bit_xor(h3,bit_rshift(h3,16))
+h4=bit_xor(h4,bit_rshift(h4,16))h4=_mul32(h4,0x85ebca6b)h4=bit_xor(h4,bit_rshift(h4,13))h4=_mul32(h4,0xc2b2ae35)h4=bit_xor(h4,bit_rshift(h4,16))
 return h1==_cs[1]and h2==_cs[2]and h3==_cs[3]and h4==_cs[4]
 end
 if not ${antiDbg} and ${predGuard} and _vcs()then
-local vm=${vmName}.new(${bcVar},${keyRecon},${bcNonceStr},${ksVar})
+local vm=${vmName}.new(${bcVar},${keyRecon},${bcNonceStr},${ksVar},${smRegionsStr})
 vm:run()
 end
 end`;
@@ -1945,7 +1935,7 @@ end`;
 }
 
 class OclareEngine {
-    constructor() { this.version = '2.0'; }
+    constructor() { this.version = '1.0'; }
 
     async process(code, options = {}, id = null) {
         const target = options.target || LuaTarget.LUA_53;
@@ -1994,7 +1984,7 @@ class OclareEngine {
                 buildId: buildConfig.BUILD_ID,
                 opsUsed: compiled.usedOps.size,
                 target: target,
-                encryptionMethod: _sodium ? 'xsalsa20poly1305' : 'chacha20',
+                encryptionMethod: 'chacha20',
                 version: this.version
             }
         };
@@ -2021,7 +2011,7 @@ self.onmessage = async function(ev) {
 };
 
 self.addEventListener('error', (e) => {
-    self.postMessage({ type: 'error', error: e && e.message ? e.message : String(e) });
+    self.postMessage({ type: 'error', id: null, error: e && e.message ? e.message : String(e) });
 });
 
 if (typeof module !== 'undefined') {
